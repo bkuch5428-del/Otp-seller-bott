@@ -52,24 +52,24 @@ def env_list(name, default_csv):
     raw = os.getenv(name, default_csv)
     return [item.strip() for item in raw.split(",") if item.strip()]
 
-API_ID = env_int("API_ID", 33475644)
-API_HASH = os.getenv("API_HASH", "99d0f874584f6d0f1e6328d905eacaeb")
-BOT_TOKEN = os.getenv("8727494915:AAFDtioiw6O9A95wq1EYoZspNeZbpGkELFc")
+API_ID = env_int("API_ID", 33606463)
+API_HASH = os.getenv("API_HASH", "1856fbd4b9930dda8e3b271576d3aaaf")
+BOT_TOKEN = os.getenv("8934381456:AAEW3M2NxBhQiDbvnp7CAOuvcY1Q5o-O7V4")
 
 # ========== BOTH ADMINS ==========
-ADMIN_IDS = [7905175526]
+ADMIN_IDS = [8854022509]
 
 # ========== CHANNELS ==========
-LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1003850908144)
+LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1004359100536)
 
 CHECK_CHANNELS = env_list(
     "CHECK_CHANNELS",
-    "-1003850908144"
+    "-1004359100536"
 )
 
 JOIN_URLS = env_list(
     "JOIN_URLS",
-    "https://t.me/Vegeta_Vouches"
+    "https://t.me/moviesmasterupdates"
 )
 
 # ========== LINKS & MEDIA ==========
@@ -79,7 +79,7 @@ TERMS_URL = os.getenv(
 )
 
 # ========== UPI DETAILS ==========
-UPI_ID = "hetking@fam"
+UPI_ID = "bobbyahirwar@fam"
 UPI_QR = "https://files.catbox.moe/m5c01u.jpg"
 
 # ========== CWALLET DETAILS ==========
