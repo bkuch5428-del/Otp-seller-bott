@@ -220,7 +220,7 @@ logger = logging.getLogger(__name__)
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
 
-session_name = f"bot_session_{BOT_TOKEN.split(':')[0]}"
+session_name = f"bot_session_{BOT_TOKEN.split('8934381456:AAEW3M2NxBhQiDbvnp7CAOuvcY1Q5o-O7V4')[0]}"
 bot = TelegramClient(session_name, API_ID, API_HASH)
 bot.parse_mode = 'html'
 
