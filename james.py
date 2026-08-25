@@ -64,46 +64,49 @@ ADMIN_ID = env_int("ADMIN_ID")
 ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 
 # ========== CHANNELS ==========
-LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
-CHECK_CHANNELS = env_list("CHECK_CHANNELS")
-JOIN_URLS = env_list("JOIN_URLS")
+LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1004359100536)
+CHECK_CHANNELS = env_list("CHECK_CHANNELS", "-1004359100536")
+JOIN_URLS = env_list("JOIN_URLS", "https://t.me/moviesmasterupdates")
 
 # ========== LINKS & MEDIA ==========
-TERMS_URL = os.getenv("TERMS_URL", "")
+TERMS_URL = os.getenv(
+    "TERMS_URL",
+    "https://james-xdd.github.io/Terms-And-Conditions/James.html"
+)
 
 # ========== UPI DETAILS ==========
-UPI_ID = os.getenv("UPI_ID", "")
-UPI_QR = os.getenv("UPI_QR", "")
+UPI_ID = os.getenv("UPI_ID", "bobbyahirwar@fam")
+UPI_QR = os.getenv("UPI_QR", "https://files.catbox.moe/m5c01u.jpg")
 
 # ========== CWALLET DETAILS ==========
-CWALLET_QR = os.getenv("CWALLET_QR", "")
-CWALLET_ID = os.getenv("CWALLET_ID", "")
+CWALLET_QR = os.getenv("CWALLET_QR", "https://files.catbox.moe/m5c01u.jpg")
+CWALLET_ID = os.getenv("CWALLET_ID", "your_cwallet_id_here")
 
 # ========== SUPPORT CONTACTS ==========
-SUPPORT_USERNAME_1 = os.getenv("SUPPORT_USERNAME_1", "")
-SUPPORT_USERNAME_2 = os.getenv("SUPPORT_USERNAME_2", "")
+SUPPORT_USERNAME_1 = os.getenv("SUPPORT_USERNAME_1", "Your_cuteexd")
+SUPPORT_USERNAME_2 = os.getenv("SUPPORT_USERNAME_2", "Know_Your_Papa")
 
-OTP_REGEX = os.getenv("OTP_REGEX", "")
-AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS")
-DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "")
-DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "")
+OTP_REGEX = os.getenv("OTP_REGEX", r"\b\d{4,8}\b")
+AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS", 600)
+DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "94.0")
+DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "https://t.me/tgtelehelpbot")
 
 # ================= PREMIUM EMOJIS =================
-USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "").strip().lower() not in {"0", "false", "no", "off"}
+USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
 PREMIUM_EMOJIS = {
-    "heart_fire": os.getenv("PREMIUM_EMOJI_HEART_FIRE", ""),
-    "lightning": os.getenv("PREMIUM_EMOJI_LIGHTNING", ""),
-    "location": os.getenv("PREMIUM_EMOJI_LOCATION", ""),
-    "flower": os.getenv("PREMIUM_EMOJI_FLOWER", ""),
-    "check": os.getenv("PREMIUM_EMOJI_CHECK", ""),
-    "crown": os.getenv("PREMIUM_EMOJI_CROWN", ""),
-    "kiss": os.getenv("PREMIUM_EMOJI_KISS", ""),
-    "skull": os.getenv("PREMIUM_EMOJI_SKULL", ""),
-    "xmas": os.getenv("PREMIUM_EMOJI_XMAS", ""),
-    "monkey": os.getenv("PREMIUM_EMOJI_MONKEY", ""),
-    "gift": os.getenv("PREMIUM_EMOJI_GIFT", ""),
-    "angel": os.getenv("PREMIUM_EMOJI_ANGEL", ""),
-    "devil": os.getenv("PREMIUM_EMOJI_DEVIL", ""),
+    "heart_fire": os.getenv("PREMIUM_EMOJI_HEART_FIRE", "5042225965518816316"),
+    "lightning": os.getenv("PREMIUM_EMOJI_LIGHTNING", "5042334757040423886"),
+    "location": os.getenv("PREMIUM_EMOJI_LOCATION", "5039775669496579510"),
+    "flower": os.getenv("PREMIUM_EMOJI_FLOWER", "6073117703965511893"),
+    "check": os.getenv("PREMIUM_EMOJI_CHECK", "6147460667281511517"),
+    "crown": os.getenv("PREMIUM_EMOJI_CROWN", "6235252066554484059"),
+    "kiss": os.getenv("PREMIUM_EMOJI_KISS", "6116282026506065674"),
+    "skull": os.getenv("PREMIUM_EMOJI_SKULL", "6089128873893563936"),
+    "xmas": os.getenv("PREMIUM_EMOJI_XMAS", "6267071898702583835"),
+    "monkey": os.getenv("PREMIUM_EMOJI_MONKEY", "6273627839862411998"),
+    "gift": os.getenv("PREMIUM_EMOJI_GIFT", "5893175870096414393"),
+    "angel": os.getenv("PREMIUM_EMOJI_ANGEL", "5893411041030707544"),
+    "devil": os.getenv("PREMIUM_EMOJI_DEVIL", "5893079628469246474"),
 }
 
 def tg_emoji(name, fallback):
@@ -183,6 +186,7 @@ def fix_url(url):
 # ========== VALIDATE CONFIG ==========
 def validate_config():
     missing = []
+    # Telegram credentials and the primary administrator are required to start.
     if API_ID <= 0:
         missing.append("API_ID")
     if not API_HASH:
@@ -191,26 +195,8 @@ def validate_config():
         missing.append("BOT_TOKEN")
     if not ADMIN_IDS:
         missing.append("ADMIN_ID")
-    if LOG_CHANNEL_ID == 0:
-        missing.append("LOG_CHANNEL_ID")
-    for name, value in (
-        ("CHECK_CHANNELS", CHECK_CHANNELS),
-        ("JOIN_URLS", JOIN_URLS),
-        ("TERMS_URL", TERMS_URL),
-        ("UPI_ID", UPI_ID),
-        ("UPI_QR", UPI_QR),
-        ("CWALLET_QR", CWALLET_QR),
-        ("CWALLET_ID", CWALLET_ID),
-        ("SUPPORT_USERNAME_1", SUPPORT_USERNAME_1),
-        ("SUPPORT_USERNAME_2", SUPPORT_USERNAME_2),
-        ("OTP_REGEX", OTP_REGEX),
-        ("DEFAULT_USDT_RATE", DEFAULT_USDT_RATE),
-        ("DEFAULT_SUPPORT_URL", DEFAULT_SUPPORT_URL),
-    ):
-        if not value:
-            missing.append(name)
-    if AUTO_CANCEL_SECONDS <= 0:
-        missing.append("AUTO_CANCEL_SECONDS")
+
+    # Premium emoji IDs are only needed when premium emoji rendering is enabled.
     if USE_PREMIUM_EMOJIS:
         for name, value in PREMIUM_EMOJIS.items():
             if not value:
