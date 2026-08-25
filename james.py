@@ -46,69 +46,64 @@ def env_int(name, default=0):
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
         return default
-    return int(str(raw).strip())
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        return default
 
-def env_list(name, default_csv):
+def env_list(name, default_csv=""):
     raw = os.getenv(name, default_csv)
     return [item.strip() for item in raw.split(",") if item.strip()]
 
-API_ID = env_int("API_ID", 33606463)
-API_HASH = os.getenv("API_HASH", "1856fbd4b9930dda8e3b271576d3aaaf")
-BOT_TOKEN = os.getenv("8934381456:AAEW3M2NxBhQiDbvnp7CAOuvcY1Q5o-O7V4")
+API_ID = env_int("API_ID")
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ========== BOTH ADMINS ==========
-ADMIN_IDS = [8854022509]
+ADMIN_ID = env_int("ADMIN_ID")
+ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 
 # ========== CHANNELS ==========
-LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1004359100536)
-
-CHECK_CHANNELS = env_list(
-    "CHECK_CHANNELS",
-    "-1004359100536"
-)
-
-JOIN_URLS = env_list(
-    "JOIN_URLS",
-    "https://t.me/moviesmasterupdates"
-)
+LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID")
+CHECK_CHANNELS = env_list("CHECK_CHANNELS")
+JOIN_URLS = env_list("JOIN_URLS")
 
 # ========== LINKS & MEDIA ==========
-TERMS_URL = os.getenv(
-    "TERMS_URL",
-    "https://james-xdd.github.io/Terms-And-Conditions/James.html"
-)
+TERMS_URL = os.getenv("TERMS_URL", "")
 
 # ========== UPI DETAILS ==========
-UPI_ID = "bobbyahirwar@fam"
-UPI_QR = "https://files.catbox.moe/m5c01u.jpg"
+UPI_ID = os.getenv("UPI_ID", "")
+UPI_QR = os.getenv("UPI_QR", "")
 
 # ========== CWALLET DETAILS ==========
-CWALLET_QR = "https://files.catbox.moe/m5c01u.jpg"
-CWALLET_ID = os.getenv("CWALLET_ID", "your_cwallet_id_here")
+CWALLET_QR = os.getenv("CWALLET_QR", "")
+CWALLET_ID = os.getenv("CWALLET_ID", "")
 
 # ========== SUPPORT CONTACTS ==========
-SUPPORT_USERNAME_1 = "Your_cuteexd"
-SUPPORT_USERNAME_2 = "Know_Your_Papa"
+SUPPORT_USERNAME_1 = os.getenv("SUPPORT_USERNAME_1", "")
+SUPPORT_USERNAME_2 = os.getenv("SUPPORT_USERNAME_2", "")
 
-OTP_REGEX = r"\b\d{4,8}\b"
-AUTO_CANCEL_SECONDS = 600
+OTP_REGEX = os.getenv("OTP_REGEX", "")
+AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS")
+DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "")
+DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "")
 
 # ================= PREMIUM EMOJIS =================
-USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
+USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "").strip().lower() not in {"0", "false", "no", "off"}
 PREMIUM_EMOJIS = {
-    "heart_fire": "5042225965518816316",
-    "lightning": "5042334757040423886",
-    "location": "5039775669496579510",
-    "flower": "6073117703965511893",
-    "check": "6147460667281511517",
-    "crown": "6235252066554484059",
-    "kiss": "6116282026506065674",
-    "skull": "6089128873893563936",
-    "xmas": "6267071898702583835",
-    "monkey": "6273627839862411998",
-    "gift": "5893175870096414393",
-    "angel": "5893411041030707544",
-    "devil": "5893079628469246474",
+    "heart_fire": os.getenv("PREMIUM_EMOJI_HEART_FIRE", ""),
+    "lightning": os.getenv("PREMIUM_EMOJI_LIGHTNING", ""),
+    "location": os.getenv("PREMIUM_EMOJI_LOCATION", ""),
+    "flower": os.getenv("PREMIUM_EMOJI_FLOWER", ""),
+    "check": os.getenv("PREMIUM_EMOJI_CHECK", ""),
+    "crown": os.getenv("PREMIUM_EMOJI_CROWN", ""),
+    "kiss": os.getenv("PREMIUM_EMOJI_KISS", ""),
+    "skull": os.getenv("PREMIUM_EMOJI_SKULL", ""),
+    "xmas": os.getenv("PREMIUM_EMOJI_XMAS", ""),
+    "monkey": os.getenv("PREMIUM_EMOJI_MONKEY", ""),
+    "gift": os.getenv("PREMIUM_EMOJI_GIFT", ""),
+    "angel": os.getenv("PREMIUM_EMOJI_ANGEL", ""),
+    "devil": os.getenv("PREMIUM_EMOJI_DEVIL", ""),
 }
 
 def tg_emoji(name, fallback):
@@ -172,7 +167,7 @@ P_UTR = '🧾'
 # ========== URL HELPER ==========
 def fix_url(url):
     if not url:
-        return "https://t.me/telegram"
+        return DEFAULT_SUPPORT_URL
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         if url.startswith("t.me/") or url.startswith("@") or "t.me" in url:
@@ -195,14 +190,33 @@ def validate_config():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         missing.append("BOT_TOKEN")
     if not ADMIN_IDS:
-        missing.append("ADMIN_IDS")
+        missing.append("ADMIN_ID")
     if LOG_CHANNEL_ID == 0:
         missing.append("LOG_CHANNEL_ID")
+    for name, value in (
+        ("CHECK_CHANNELS", CHECK_CHANNELS),
+        ("JOIN_URLS", JOIN_URLS),
+        ("TERMS_URL", TERMS_URL),
+        ("UPI_ID", UPI_ID),
+        ("UPI_QR", UPI_QR),
+        ("CWALLET_QR", CWALLET_QR),
+        ("CWALLET_ID", CWALLET_ID),
+        ("SUPPORT_USERNAME_1", SUPPORT_USERNAME_1),
+        ("SUPPORT_USERNAME_2", SUPPORT_USERNAME_2),
+        ("OTP_REGEX", OTP_REGEX),
+        ("DEFAULT_USDT_RATE", DEFAULT_USDT_RATE),
+        ("DEFAULT_SUPPORT_URL", DEFAULT_SUPPORT_URL),
+    ):
+        if not value:
+            missing.append(name)
+    if AUTO_CANCEL_SECONDS <= 0:
+        missing.append("AUTO_CANCEL_SECONDS")
+    if USE_PREMIUM_EMOJIS:
+        for name, value in PREMIUM_EMOJIS.items():
+            if not value:
+                missing.append(f"PREMIUM_EMOJI_{name.upper()}")
     if missing:
-        raise RuntimeError(
-            "Missing/invalid required config: " + ", ".join(missing) +
-            ". Set them via environment variables before starting the bot."
-        )
+        raise RuntimeError("Missing/invalid environment variables: " + ", ".join(missing))
     if not CHECK_CHANNELS:
         logger.warning("CHECK_CHANNELS is empty; join verification will be ineffective.")
     if not JOIN_URLS:
@@ -216,6 +230,8 @@ def validate_config():
 # ================= INITIALIZATION =================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+validate_config()
 
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
@@ -368,12 +384,12 @@ def ensure_user(uid):
 
 def get_usdt_rate():
     res = cur.execute("SELECT value FROM settings WHERE key='usdt_rate'").fetchone()
-    try: return float(res[0]) if res else 94.0
-    except: return 94.0
+    try: return float(res[0]) if res else float(DEFAULT_USDT_RATE)
+    except: return float(DEFAULT_USDT_RATE)
 
 def get_support_url():
     res = cur.execute("SELECT value FROM settings WHERE key='support_url'").fetchone()
-    url = res[0] if res and res[0] else "https://t.me/tgtelehelpbot"
+    url = res[0] if res and res[0] else DEFAULT_SUPPORT_URL
     return fix_url(url)
 
 def to_usd(inr):
@@ -550,8 +566,8 @@ def get_terms_buttons():
 
 def get_support_buttons():
     buttons = [
-        [Button.url("📩 @Your_cuteexd", f"https://t.me/{SUPPORT_USERNAME_1}")],
-        [Button.url("📩 @Know_Your_Papa", f"https://t.me/{SUPPORT_USERNAME_2}")],
+        [Button.url(f"📩 @{SUPPORT_USERNAME_1}", f"https://t.me/{SUPPORT_USERNAME_1}")],
+        [Button.url(f"📩 @{SUPPORT_USERNAME_2}", f"https://t.me/{SUPPORT_USERNAME_2}")],
         [Button.url("📜 Terms & Conditions", fix_url(TERMS_URL))]
     ]
     if JOIN_URLS and JOIN_URLS[0]:
@@ -2201,12 +2217,10 @@ async def main():
     print("=" * 50)
     print(f"✅ Admins: {ADMIN_IDS}")
     print(f"✅ Support: @{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
-    print(f"✅ UPI ID: {UPI_ID}")
     print("=" * 50)
     await bot.run_until_disconnected()
 
 if __name__ == '__main__':
-    validate_config()
     bot.start(bot_token=BOT_TOKEN)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())

@@ -1,0 +1,71 @@
+services:
+  - type: worker
+    name: telegram-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python james.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: LOG_CHANNEL_ID
+        sync: false
+      - key: CHECK_CHANNELS
+        sync: false
+      - key: JOIN_URLS
+        sync: false
+      - key: TERMS_URL
+        sync: false
+      - key: UPI_ID
+        sync: false
+      - key: UPI_QR
+        sync: false
+      - key: CWALLET_QR
+        sync: false
+      - key: CWALLET_ID
+        sync: false
+      - key: SUPPORT_USERNAME_1
+        sync: false
+      - key: SUPPORT_USERNAME_2
+        sync: false
+      - key: OTP_REGEX
+        sync: false
+      - key: AUTO_CANCEL_SECONDS
+        sync: false
+      - key: DEFAULT_USDT_RATE
+        sync: false
+      - key: DEFAULT_SUPPORT_URL
+        sync: false
+      - key: USE_PREMIUM_EMOJIS
+        sync: false
+      - key: PREMIUM_EMOJI_HEART_FIRE
+        sync: false
+      - key: PREMIUM_EMOJI_LIGHTNING
+        sync: false
+      - key: PREMIUM_EMOJI_LOCATION
+        sync: false
+      - key: PREMIUM_EMOJI_FLOWER
+        sync: false
+      - key: PREMIUM_EMOJI_CHECK
+        sync: false
+      - key: PREMIUM_EMOJI_CROWN
+        sync: false
+      - key: PREMIUM_EMOJI_KISS
+        sync: false
+      - key: PREMIUM_EMOJI_SKULL
+        sync: false
+      - key: PREMIUM_EMOJI_XMAS
+        sync: false
+      - key: PREMIUM_EMOJI_MONKEY
+        sync: false
+      - key: PREMIUM_EMOJI_GIFT
+        sync: false
+      - key: PREMIUM_EMOJI_ANGEL
+        sync: false
+      - key: PREMIUM_EMOJI_DEVIL
+        sync: false
