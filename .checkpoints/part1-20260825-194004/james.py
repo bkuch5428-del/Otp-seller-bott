@@ -5,12 +5,10 @@ import asyncio
 import time
 import logging
 import aiohttp
-from aiohttp import web
 import csv
 import zipfile
 import shutil
 import html
-import json
 from datetime import datetime
 from urllib.parse import quote
 
@@ -21,7 +19,7 @@ from telethon.errors import (
     UserNotParticipantError,
     ChatAdminRequiredError
 )
-from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButtonRow, KeyboardButton, InputPhoto
+from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButtonRow, KeyboardButton
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.functions.account import GetPasswordRequest
 
@@ -48,27 +46,31 @@ def env_int(name, default=0):
     raw = os.getenv(name)
     if raw is None or str(raw).strip() == "":
         return default
-    try:
-        return int(str(raw).strip())
-    except ValueError:
-        return default
+    return int(str(raw).strip())
 
-def env_list(name, default_csv=""):
+def env_list(name, default_csv):
     raw = os.getenv(name, default_csv)
     return [item.strip() for item in raw.split(",") if item.strip()]
 
-API_ID = env_int("API_ID")
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_ID = env_int("API_ID", 33606463)
+API_HASH = os.getenv("API_HASH", "1856fbd4b9930dda8e3b271576d3aaaf")
+BOT_TOKEN = os.getenv("8934381456:AAEW3M2NxBhQiDbvnp7CAOuvcY1Q5o-O7V4")
 
 # ========== BOTH ADMINS ==========
-ADMIN_ID = env_int("ADMIN_ID")
-ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
+ADMIN_IDS = [8854022509]
 
 # ========== CHANNELS ==========
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1004359100536)
-CHECK_CHANNELS = env_list("CHECK_CHANNELS", "-1004359100536")
-JOIN_URLS = env_list("JOIN_URLS", "https://t.me/moviesmasterupdates")
+
+CHECK_CHANNELS = env_list(
+    "CHECK_CHANNELS",
+    "-1004359100536"
+)
+
+JOIN_URLS = env_list(
+    "JOIN_URLS",
+    "https://t.me/moviesmasterupdates"
+)
 
 # ========== LINKS & MEDIA ==========
 TERMS_URL = os.getenv(
@@ -77,38 +79,36 @@ TERMS_URL = os.getenv(
 )
 
 # ========== UPI DETAILS ==========
-UPI_ID = os.getenv("UPI_ID", "bobbyahirwar@fam")
-UPI_QR = os.getenv("UPI_QR", "https://files.catbox.moe/m5c01u.jpg")
+UPI_ID = "bobbyahirwar@fam"
+UPI_QR = "https://files.catbox.moe/m5c01u.jpg"
 
 # ========== CWALLET DETAILS ==========
-CWALLET_QR = os.getenv("CWALLET_QR", "https://files.catbox.moe/m5c01u.jpg")
+CWALLET_QR = "https://files.catbox.moe/m5c01u.jpg"
 CWALLET_ID = os.getenv("CWALLET_ID", "your_cwallet_id_here")
 
 # ========== SUPPORT CONTACTS ==========
-SUPPORT_USERNAME_1 = os.getenv("SUPPORT_USERNAME_1", "Your_cuteexd")
-SUPPORT_USERNAME_2 = os.getenv("SUPPORT_USERNAME_2", "Know_Your_Papa")
+SUPPORT_USERNAME_1 = "Your_cuteexd"
+SUPPORT_USERNAME_2 = "Know_Your_Papa"
 
-OTP_REGEX = os.getenv("OTP_REGEX", r"\b\d{4,8}\b")
-AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS", 600)
-DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "94.0")
-DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "https://t.me/tgtelehelpbot")
+OTP_REGEX = r"\b\d{4,8}\b"
+AUTO_CANCEL_SECONDS = 600
 
 # ================= PREMIUM EMOJIS =================
 USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
 PREMIUM_EMOJIS = {
-    "heart_fire": os.getenv("PREMIUM_EMOJI_HEART_FIRE", "5042225965518816316"),
-    "lightning": os.getenv("PREMIUM_EMOJI_LIGHTNING", "5042334757040423886"),
-    "location": os.getenv("PREMIUM_EMOJI_LOCATION", "5039775669496579510"),
-    "flower": os.getenv("PREMIUM_EMOJI_FLOWER", "6073117703965511893"),
-    "check": os.getenv("PREMIUM_EMOJI_CHECK", "6147460667281511517"),
-    "crown": os.getenv("PREMIUM_EMOJI_CROWN", "6235252066554484059"),
-    "kiss": os.getenv("PREMIUM_EMOJI_KISS", "6116282026506065674"),
-    "skull": os.getenv("PREMIUM_EMOJI_SKULL", "6089128873893563936"),
-    "xmas": os.getenv("PREMIUM_EMOJI_XMAS", "6267071898702583835"),
-    "monkey": os.getenv("PREMIUM_EMOJI_MONKEY", "6273627839862411998"),
-    "gift": os.getenv("PREMIUM_EMOJI_GIFT", "5893175870096414393"),
-    "angel": os.getenv("PREMIUM_EMOJI_ANGEL", "5893411041030707544"),
-    "devil": os.getenv("PREMIUM_EMOJI_DEVIL", "5893079628469246474"),
+    "heart_fire": "5042225965518816316",
+    "lightning": "5042334757040423886",
+    "location": "5039775669496579510",
+    "flower": "6073117703965511893",
+    "check": "6147460667281511517",
+    "crown": "6235252066554484059",
+    "kiss": "6116282026506065674",
+    "skull": "6089128873893563936",
+    "xmas": "6267071898702583835",
+    "monkey": "6273627839862411998",
+    "gift": "5893175870096414393",
+    "angel": "5893411041030707544",
+    "devil": "5893079628469246474",
 }
 
 def tg_emoji(name, fallback):
@@ -172,7 +172,7 @@ P_UTR = '🧾'
 # ========== URL HELPER ==========
 def fix_url(url):
     if not url:
-        return DEFAULT_SUPPORT_URL
+        return "https://t.me/telegram"
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         if url.startswith("t.me/") or url.startswith("@") or "t.me" in url:
@@ -188,7 +188,6 @@ def fix_url(url):
 # ========== VALIDATE CONFIG ==========
 def validate_config():
     missing = []
-    # Telegram credentials and the primary administrator are required to start.
     if API_ID <= 0:
         missing.append("API_ID")
     if not API_HASH:
@@ -196,15 +195,14 @@ def validate_config():
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
         missing.append("BOT_TOKEN")
     if not ADMIN_IDS:
-        missing.append("ADMIN_ID")
-
-    # Premium emoji IDs are only needed when premium emoji rendering is enabled.
-    if USE_PREMIUM_EMOJIS:
-        for name, value in PREMIUM_EMOJIS.items():
-            if not value:
-                missing.append(f"PREMIUM_EMOJI_{name.upper()}")
+        missing.append("ADMIN_IDS")
+    if LOG_CHANNEL_ID == 0:
+        missing.append("LOG_CHANNEL_ID")
     if missing:
-        raise RuntimeError("Missing/invalid environment variables: " + ", ".join(missing))
+        raise RuntimeError(
+            "Missing/invalid required config: " + ", ".join(missing) +
+            ". Set them via environment variables before starting the bot."
+        )
     if not CHECK_CHANNELS:
         logger.warning("CHECK_CHANNELS is empty; join verification will be ineffective.")
     if not JOIN_URLS:
@@ -218,8 +216,6 @@ def validate_config():
 # ================= INITIALIZATION =================
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-validate_config()
 
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
@@ -236,7 +232,6 @@ active_orders = {}
 waiting_proof = {}      
 deposit_input = {} 
 admin_dep_state = {}    
-admin_content_state = {}
 user_spam_cooldown = {} 
 session_buy_state = {}  
 custom_dep_amt = {}     
@@ -373,55 +368,13 @@ def ensure_user(uid):
 
 def get_usdt_rate():
     res = cur.execute("SELECT value FROM settings WHERE key='usdt_rate'").fetchone()
-    try: return float(res[0]) if res else float(DEFAULT_USDT_RATE)
-    except: return float(DEFAULT_USDT_RATE)
+    try: return float(res[0]) if res else 94.0
+    except: return 94.0
 
 def get_support_url():
     res = cur.execute("SELECT value FROM settings WHERE key='support_url'").fetchone()
-    url = res[0] if res and res[0] else DEFAULT_SUPPORT_URL
+    url = res[0] if res and res[0] else "https://t.me/tgtelehelpbot"
     return fix_url(url)
-
-def get_setting(key, default=None):
-    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row[0] if row else default
-
-def set_setting(key, value):
-    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    db.commit()
-
-def delete_setting(key):
-    cur.execute("DELETE FROM settings WHERE key=?", (key,))
-    db.commit()
-
-def get_default_welcome(uid, pct, bot_username):
-    ref_line = (
-        f"{P_GLOBE} <code>https://t.me/{bot_username}?start=ref_{uid}</code>"
-        if bot_username else
-        f"{P_GLOBE} <i>Set a public bot username to enable referral links.</i>"
-    )
-    return (f"{PE_HEART} <b>Welcome to Fresh Tg Store!</b>\n\n"
-            f"{PE_GIFT} <b>Premium services:</b> Buy accounts, sessions, and top up instantly.\n"
-            f"{P_GIFT} <b>Refer & Earn:</b>\nInvite friends and earn {pct}% of their deposits!\n"
-            f"{ref_line}\n\n"
-            f"👨‍💻 <b>Developers:</b>\n@{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
-
-def get_welcome_message(uid, pct, bot_username):
-    saved = get_setting("welcome_message")
-    return saved if saved is not None else get_default_welcome(uid, pct, bot_username)
-
-def get_banner_media():
-    raw = get_setting("banner_photo")
-    if not raw:
-        return None
-    try:
-        data = json.loads(raw)
-        return InputPhoto(
-            id=int(data["id"]),
-            access_hash=int(data["access_hash"]),
-            file_reference=bytes.fromhex(data["file_reference"])
-        )
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return None
 
 def to_usd(inr):
     return round(inr / get_usdt_rate(), 2)
@@ -597,8 +550,8 @@ def get_terms_buttons():
 
 def get_support_buttons():
     buttons = [
-        [Button.url(f"📩 @{SUPPORT_USERNAME_1}", f"https://t.me/{SUPPORT_USERNAME_1}")],
-        [Button.url(f"📩 @{SUPPORT_USERNAME_2}", f"https://t.me/{SUPPORT_USERNAME_2}")],
+        [Button.url("📩 @Your_cuteexd", f"https://t.me/{SUPPORT_USERNAME_1}")],
+        [Button.url("📩 @Know_Your_Papa", f"https://t.me/{SUPPORT_USERNAME_2}")],
         [Button.url("📜 Terms & Conditions", fix_url(TERMS_URL))]
     ]
     if JOIN_URLS and JOIN_URLS[0]:
@@ -624,28 +577,23 @@ async def send_main_menu(event, uid):
     pct_row = cur.execute("SELECT value FROM settings WHERE key='ref_percent'").fetchone()
     pct = pct_row[0] if pct_row else "3"
     bot_username = me.username or ""
-    msg = get_welcome_message(uid, pct, bot_username)
-    banner = get_banner_media() if get_setting("images_enabled", "off") == "on" else None
-    menu = get_persistent_menu(uid)
+    ref_line = (
+        f"{P_GLOBE} <code>https://t.me/{bot_username}?start=ref_{uid}</code>"
+        if bot_username else
+        f"{P_GLOBE} <i>Set a public bot username to enable referral links.</i>"
+    )
+    msg = (f"{PE_HEART} <b>Welcome to Fresh Tg Store!</b>\n\n"
+           f"{PE_GIFT} <b>Premium services:</b> Buy accounts, sessions, and top up instantly.\n"
+           f"{P_GIFT} <b>Refer & Earn:</b>\nInvite friends and earn {pct}% of their deposits!\n"
+           f"{ref_line}\n\n"
+           f"👨‍💻 <b>Developers:</b>\n@{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
     
     if isinstance(event, events.CallbackQuery.Event):
         try: await event.delete()
         except: pass
-        if banner:
-            try:
-                await bot.send_file(uid, banner, caption=msg, buttons=menu)
-                return
-            except Exception:
-                pass
-        await bot.send_message(uid, msg, buttons=menu)
+        await bot.send_message(uid, msg, buttons=get_persistent_menu(uid))
     else:
-        if banner:
-            try:
-                await bot.send_file(uid, banner, caption=msg, buttons=menu)
-                return
-            except Exception:
-                pass
-        await event.respond(msg, buttons=menu)
+        await event.respond(msg, buttons=get_persistent_menu(uid))
 
 # ================= DEPOSIT HANDLERS =================
 def format_payment_buttons(buttons):
@@ -1337,7 +1285,6 @@ async def admin_panel_handler(event):
     if uid in ADMIN_IDS or has_perm(uid, 'p_settings'):
         r5.extend([Button.inline("Discount", "adm_discount"), Button.inline("Ref %", "adm_refpct")])
         btns.append(r5)
-        btns.append([Button.inline("📝 Set Welcome Msg", "adm_welcome"), Button.inline("🖼️ Banner Images", "adm_banner")])
         btns.append([Button.inline("Support URL", "adm_supporturl"), Button.inline("Payments", "adm_payments")])
         btns.append([Button.inline("Set USDT Rate", "adm_usdtrate")])
         btns.append([Button.inline("Backup Users", "adm_backupusr"), Button.inline("Restore Users", "adm_restoreusr")])
@@ -1444,29 +1391,6 @@ async def send_autoprice_country(event, c_name):
     btns.append([Button.inline("Back", "adm_appg|1")])
     await event.edit(f"{flag} <b>Auto Price: {c_name}</b>\nSelect 'Common' for default price, or specific years:", buttons=btns)
 
-async def welcome_manager_menu(event):
-    uid = event.sender_id
-    me = await bot.get_me()
-    current = get_welcome_message(uid, get_setting("ref_percent", "3"), me.username or "")
-    btns = [
-        [Button.inline("✏️ Edit", "adm_welcome_edit"), Button.inline("👁 Preview", "adm_welcome_preview")],
-        [Button.inline("🔄 Reset", "adm_welcome_reset")],
-        [Button.inline("◀️ Back", "adm_adminmain")]
-    ]
-    await event.edit(f"📝 <b>Welcome Message</b>\n\n{current}", buttons=btns)
-
-async def banner_manager_menu(event):
-    enabled = get_setting("images_enabled", "off") == "on"
-    status = "🟢 ON" if enabled else "🔴 OFF"
-    banner_status = "configured" if get_setting("banner_photo") else "not configured"
-    btns = [
-        [Button.inline("➕ Add/Replace Banner", "adm_banner_add")],
-        [Button.inline("🗑️ Delete Banner", "adm_banner_delete"), Button.inline("👁️ Preview Banner", "adm_banner_preview")],
-        [Button.inline(f"Images {'ON' if enabled else 'OFF'}", "adm_banner_toggle")],
-        [Button.inline("◀️ Back", "adm_adminmain")]
-    ]
-    await event.edit(f"🖼️ <b>Banner Images</b>\n\nStatus: {status}\nBanner: {banner_status}", buttons=btns)
-
 async def admin_actions(event):
     data_full = event.data.decode()
     if not data_full.startswith("adm_"): return
@@ -1478,50 +1402,6 @@ async def admin_actions(event):
         await event.delete()
         class FakeEvent: chat_id = chat; sender_id = uid
         return await admin_panel_handler(FakeEvent())
-
-    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle"} and not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
-        return await event.answer("Not authorized.", alert=True)
-
-    if action_data == "welcome":
-        return await welcome_manager_menu(event)
-    if action_data == "welcome_edit":
-        admin_content_state[uid] = "welcome"
-        return await event.edit("📝 <b>Send the new welcome message.</b>\nHTML formatting is supported.", buttons=[[Button.inline("◀️ Cancel", "adm_welcome_cancel")]])
-    if action_data == "welcome_cancel":
-        admin_content_state.pop(uid, None)
-        return await welcome_manager_menu(event)
-    if action_data == "welcome_preview":
-        me = await bot.get_me()
-        await bot.send_message(uid, get_welcome_message(uid, get_setting("ref_percent", "3"), me.username or ""))
-        return await event.answer("Preview sent.", alert=True)
-    if action_data == "welcome_reset":
-        delete_setting("welcome_message")
-        await event.answer("Welcome message reset.", alert=True)
-        return await welcome_manager_menu(event)
-    if action_data == "banner":
-        return await banner_manager_menu(event)
-    if action_data == "banner_add":
-        admin_content_state[uid] = "banner"
-        return await event.edit("🖼️ <b>Send the banner image/photo.</b>", buttons=[[Button.inline("◀️ Cancel", "adm_banner_cancel")]])
-    if action_data == "banner_cancel":
-        admin_content_state.pop(uid, None)
-        return await banner_manager_menu(event)
-    if action_data == "banner_toggle":
-        set_setting("images_enabled", "off" if get_setting("images_enabled", "off") == "on" else "on")
-        return await banner_manager_menu(event)
-    if action_data == "banner_delete":
-        delete_setting("banner_photo")
-        await event.answer("Banner deleted.", alert=True)
-        return await banner_manager_menu(event)
-    if action_data == "banner_preview":
-        banner = get_banner_media()
-        if not banner:
-            return await event.answer("No banner configured.", alert=True)
-        try:
-            await bot.send_file(uid, banner)
-            return await event.answer("Preview sent.", alert=True)
-        except Exception:
-            return await event.answer("Banner reference expired. Upload it again.", alert=True)
 
     if action_data == "togglebot" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         new_status = 'off' if is_bot_online() else 'on'
@@ -1964,7 +1844,7 @@ async def handle_all_messages(e):
     try:
         uid = e.sender_id
         if not uid: return
-        if getattr(e, 'text', None) and e.text.startswith('/') and not (e.text.strip().lower() == '/cancel' and uid in admin_content_state): return
+        if getattr(e, 'text', None) and e.text.startswith('/'): return
         if not is_bot_online() and not is_admin(uid):
             return await e.respond(f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
         
@@ -2007,29 +1887,6 @@ async def handle_all_messages(e):
             return
 
         text = e.text or ""
-        if is_admin(uid) and uid in admin_content_state:
-            content_type = admin_content_state[uid]
-            if text.strip().lower() == "/cancel":
-                admin_content_state.pop(uid, None)
-                return await e.reply("✅ Cancelled.")
-            if content_type == "welcome":
-                if not text:
-                    return await e.reply("❌ Welcome message cannot be empty.")
-                set_setting("welcome_message", text)
-                admin_content_state.pop(uid, None)
-                return await e.reply("✅ Welcome message saved.")
-            if content_type == "banner":
-                if not e.photo:
-                    return await e.reply("❌ Please send a Telegram photo.")
-                photo = e.photo
-                reference = {
-                    "id": photo.id,
-                    "access_hash": photo.access_hash,
-                    "file_reference": photo.file_reference.hex()
-                }
-                set_setting("banner_photo", json.dumps(reference))
-                admin_content_state.pop(uid, None)
-                return await e.reply("✅ Banner added/replaced successfully.")
         if not text: return
 
         if "Buy Account" in text or "Buy Sessions" in text or "Deposit" in text or "My Profile" in text or "My Stats" in text or "Support" in text or "Admin Panel" in text:
@@ -2339,27 +2196,17 @@ async def handle_callback_query(e):
     except Exception as ex: print(f"Callback Error: {ex}")
 
 async def main():
-    port = int(os.getenv("PORT", "10000"))
-    app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="OK"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    print(f"✅ Health server listening on 0.0.0.0:{port}")
-
     print("=" * 50)
     print("✅ ULTIMATE ADVANCED HTML BOT STARTED SUCCESSFULLY")
     print("=" * 50)
     print(f"✅ Admins: {ADMIN_IDS}")
     print(f"✅ Support: @{SUPPORT_USERNAME_1} & @{SUPPORT_USERNAME_2}")
+    print(f"✅ UPI ID: {UPI_ID}")
     print("=" * 50)
-    try:
-        await bot.run_until_disconnected()
-    finally:
-        await runner.cleanup()
+    await bot.run_until_disconnected()
 
 if __name__ == '__main__':
+    validate_config()
     bot.start(bot_token=BOT_TOKEN)
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
