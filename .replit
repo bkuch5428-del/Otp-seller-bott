@@ -28,3 +28,7 @@ args = "python james.py"
 
 [workflows.workflow.metadata]
 outputType = "console"
+
+[userenv]
+
+[userenv.shared]
