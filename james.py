@@ -67,7 +67,7 @@ ADMIN_IDS = [ADMIN_ID] if ADMIN_ID else []
 
 # ========== CHANNELS ==========
 LOG_CHANNEL_ID = env_int("LOG_CHANNEL_ID", -1004359100536)
-CHECK_CHANNELS = env_list("CHECK_CHANNELS", "-1004359100536")
+REQUIRED_CHANNELS = env_list("REQUIRED_CHANNELS", os.getenv("CHECK_CHANNELS", "-1004359100536"))
 JOIN_URLS = env_list("JOIN_URLS", "https://t.me/moviesmasterupdates")
 
 # ========== LINKS & MEDIA ==========
@@ -205,14 +205,14 @@ def validate_config():
                 missing.append(f"PREMIUM_EMOJI_{name.upper()}")
     if missing:
         raise RuntimeError("Missing/invalid environment variables: " + ", ".join(missing))
-    if not CHECK_CHANNELS:
-        logger.warning("CHECK_CHANNELS is empty; join verification will be ineffective.")
+    if not REQUIRED_CHANNELS:
+        logger.warning("REQUIRED_CHANNELS is empty; join verification will be ineffective.")
     if not JOIN_URLS:
         logger.warning("JOIN_URLS is empty; users will not see join buttons.")
-    if CHECK_CHANNELS and JOIN_URLS and len(CHECK_CHANNELS) != len(JOIN_URLS):
+    if REQUIRED_CHANNELS and JOIN_URLS and len(REQUIRED_CHANNELS) != len(JOIN_URLS):
         logger.warning(
-            "CHECK_CHANNELS (%s) and JOIN_URLS (%s) lengths differ.",
-            len(CHECK_CHANNELS), len(JOIN_URLS)
+            "REQUIRED_CHANNELS (%s) and JOIN_URLS (%s) lengths differ.",
+            len(REQUIRED_CHANNELS), len(JOIN_URLS)
         )
 
 # ================= INITIALIZATION =================
@@ -443,7 +443,7 @@ def delete_session_files(session_path):
 
 async def check_channel_joined(uid):
     if is_admin(uid): return True
-    for ch in CHECK_CHANNELS:
+    for ch in REQUIRED_CHANNELS:
         try:
             ch_id = int(ch.strip()) if str(ch).strip().lstrip('-').isdigit() else ch.strip()
             try:
@@ -616,7 +616,7 @@ def get_join_buttons():
                 buttons.append([Button.url(f"📢 Join Channel {i+1}", fix_url(link))])
             except Exception:
                 pass
-    buttons.append([Button.inline("✅ Verify Joined", "verify_join")])
+    buttons.append([Button.inline("✅ I've Joined – Verify", "verify_join")])
     return buttons
 
 async def send_main_menu(event, uid):
@@ -1946,7 +1946,11 @@ async def handle_start(e):
 
         is_joined = await check_channel_joined(uid)
         if not is_joined:
-            msg = f"{PE_FLOWER} <b>You must join our channels first!</b>\n{PE_LOCATION} Join all required channels and then tap <b>Verify Joined</b>."
+            msg = ("🔒 Access Required\n\n"
+                   "To use this bot, please join our official channel(s) below.\n\n"
+                   "📢 Join the channel(s), then tap:\n"
+                   "✅ I've Joined – Verify\n\n"
+                   "Thank you for supporting us ❤️")
             return await e.respond(msg, buttons=get_join_buttons())
 
         row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
