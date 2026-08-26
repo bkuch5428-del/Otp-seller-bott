@@ -507,6 +507,9 @@ def get_welcome_message(uid, pct, bot_username):
 
 def get_banner_media():
     raw = get_setting("banner_photo")
+    return get_banner_reference(raw)
+
+def get_banner_reference(raw):
     if not raw:
         return None
     try:
@@ -518,6 +521,41 @@ def get_banner_media():
         )
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
+
+STORE_DEFAULT_MESSAGES = {
+    "single": (
+        "🛒 <b>ACCOUNT STORE</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "⚡ Select an account below to view details.\n\n"
+        "💱 Rate: 1 USDT = ₹{rate}\n📦 Available: {available} accounts\n\n"
+        "━━━━━━━━━━━━━━━━━━\n{products}{page}"
+    ),
+    "bulk": (
+        "🔐 <b>SESSIONS STORE</b>\n━━━━━━━━━━━━━━━━━━\n"
+        "⚡ Select a session package below.\n\n"
+        "💱 Rate: 1 USDT = ₹{rate}\n📦 Available: {available} sessions\n\n"
+        "━━━━━━━━━━━━━━━━━━\n{products}{page}"
+    )
+}
+
+STORE_DEFAULT_BUTTONS = {
+    "single": {"product": "{icon} {country}", "buy": "🛒 Buy Now", "back": "⬅️ Back to Products", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"},
+    "bulk": {"product": "{icon} {country}", "quantity": "Quantity", "confirm": "✅ Confirm", "change_quantity": "✏️ Change Quantity", "back": "⬅️ Back to Products", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"}
+}
+
+def get_store_message(flow):
+    return get_setting(f"{'account' if flow == 'single' else 'sessions'}_store_message", STORE_DEFAULT_MESSAGES[flow])
+
+def get_store_buttons(flow):
+    key = "account" if flow == "single" else "sessions"
+    raw = get_setting(f"{key}_button_labels")
+    try:
+        labels = json.loads(raw) if raw else {}
+        return {**STORE_DEFAULT_BUTTONS[flow], **labels}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return STORE_DEFAULT_BUTTONS[flow].copy()
+
+def store_banner_key(flow):
+    return "account_store_banner" if flow == "single" else "sessions_store_banner"
 
 def to_usd(inr):
     return round(inr / get_usdt_rate(), 2)
@@ -1099,36 +1137,33 @@ def get_product_stock(product):
     ).fetchone()
     return row[0] if row else 0
 
-def account_store_caption(products, page, total_pages, page_products):
-    if not products:
-        return (f"{P_CART} <b>ACCOUNT STORE</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n\n"
-                f"{P_PKG} No accounts are currently available.\n\n"
-                f"Please check again later.\n\n"
-                f"⬅️ Back")
-
-    lines = [
-        f"{P_CART} <b>ACCOUNT STORE</b>",
-        "━━━━━━━━━━━━━━━━━━",
-        "⚡ Select an account below to view details.",
-        "",
-        f"💱 Rate: 1 USDT = {P_INR}{get_usdt_rate():g}",
-        f"{P_PKG} Available: {sum(product['stock'] for product in products)} accounts",
-        "",
-        "━━━━━━━━━━━━━━━━━━"
-    ]
+def account_store_caption(products, page, total_pages, page_products, flow):
+    labels = get_store_buttons(flow)
+    product_lines = []
     for product in page_products:
         year_line = f" • {html.escape(str(product['year']))}" if product["year"] else ""
         info_line = (f"🖥 DC {html.escape(str(product['dc']))}" if product["dc"] else "") + year_line
-        lines.extend([
+        product_lines.extend([
             "",
             f"{product['icon']} <b>{html.escape(product['country'])}</b> — {html.escape(product['category'])}",
             info_line,
             f"💵 ${to_usd(product['price']):.2f} • {P_INR}{product['price']}",
             f"{P_PKG} Stock: {product['stock']}"
         ])
-    lines.append(f"\n📄 Page {page}/{total_pages}")
-    return "\n".join(lines)
+    page_text = ""
+    if total_pages > 1:
+        page_text = f"\n\n📄 {html.escape(labels['page'].format(page=page, total_pages=total_pages))}"
+    values = {
+        "rate": f"{get_usdt_rate():g}",
+        "available": sum(product["stock"] for product in products),
+        "products": "\n".join(product_lines) if product_lines else f"\n\n{P_PKG} No accounts are currently available.\n\nPlease check again later.",
+        "page": page_text,
+        "total_pages": total_pages
+    }
+    try:
+        return get_store_message(flow).format(**values)
+    except (KeyError, ValueError):
+        return STORE_DEFAULT_MESSAGES[flow].format(**values)
 
 async def render_account_store(event, flow, page=1, send_banner=False):
     limit = 10
@@ -1141,7 +1176,13 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     account_product_state[uid] = {str(index): product for index, product in enumerate(page_products)}
     product_buttons = []
     for index, product in enumerate(page_products):
-        label = f"{product['icon']} {product['country']} {product['category']}"
+        try:
+            label = get_store_buttons(flow)["product"].format(
+                icon=product["icon"], country=product["country"], category=product["category"],
+                year=product["year"], price=product["price"], stock=product["stock"]
+            )
+        except (KeyError, ValueError):
+            label = f"{product['icon']} {product['country']}"
         if len(label) > 32:
             label = label[:31] + "…"
         product_buttons.append(Button.inline(label, f"prod|{flow}|{index}"))
@@ -1150,15 +1191,15 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     if total_pages > 1:
         navigation = []
         if page > 1:
-            navigation.append(Button.inline("⬅️ Previous", f"shop|{flow}|{page - 1}"))
-        navigation.append(Button.inline(f"Page {page}/{total_pages}", "shop_noop"))
+            navigation.append(Button.inline(get_store_buttons(flow)["previous"], f"shop|{flow}|{page - 1}"))
+        navigation.append(Button.inline(get_store_buttons(flow)["page"].format(page=page, total_pages=total_pages), "shop_noop"))
         if page < total_pages:
-            navigation.append(Button.inline("Next ➡️", f"shop|{flow}|{page + 1}"))
+            navigation.append(Button.inline(get_store_buttons(flow)["next"], f"shop|{flow}|{page + 1}"))
         buttons.append(navigation)
-    buttons.append([Button.inline("⬅️ Back", "shop_back")])
+    buttons.append([Button.inline(get_store_buttons(flow)["back"], "shop_back")])
 
-    caption = account_store_caption(products, page, total_pages, page_products)
-    banner = get_banner_media() if get_setting("images_enabled", "off") == "on" else None
+    caption = account_store_caption(products, page, total_pages, page_products, flow)
+    banner = get_banner_reference(get_setting(store_banner_key(flow)))
     if send_banner and banner:
         try:
             await bot.send_file(event.chat_id, banner, caption=caption, buttons=buttons)
@@ -1176,7 +1217,7 @@ async def show_product_details(event, flow, token):
         return await event.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
     stock = get_product_stock(product)
     if stock == 0:
-        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]])
+        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]])
         return
 
     lines = [
@@ -1197,8 +1238,8 @@ async def show_product_details(event, flow, token):
         f"{P_PKG} <b>Available:</b> {stock}"
     ])
     buttons = [
-        [Button.inline("🛒 Buy Now", f"pbuy|{flow}|{token}")],
-        [Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]
+        [Button.inline(get_store_buttons(flow)["buy"], f"pbuy|{flow}|{token}")],
+        [Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]
     ]
     await event.edit("\n".join(lines), buttons=buttons)
 
@@ -1242,8 +1283,8 @@ async def confirm_purchase(event, country, year, price_str):
            f"❓ Do you want to proceed with this purchase?")
     
     btns = [
-        [Button.inline("Yes, Buy Now", f"buy_cf|{country}|{year}|{base_price}")],
-        [Button.inline("No, Cancel", "cancel_action")]
+        [Button.inline(get_store_buttons("single")["buy"], f"buy_cf|{country}|{year}|{base_price}")],
+        [Button.inline(get_store_buttons("single")["cancel"], "cancel_action")]
     ]
     await event.edit(msg, buttons=btns)
 
@@ -1378,7 +1419,7 @@ async def init_session_purchase(event, country, year, price_str):
            f"{P_MONEY} <b>Price per session:</b> {P_INR}{p_disp}\n"
            f"{P_PKG} <b>Available Stock:</b> {stock}\n\n"
            f"👇 <b>Reply to this message</b> with the <b>Number of Sessions</b> you want to buy.")
-    await event.edit(msg, buttons=[[Button.inline("Cancel", "cancel_action")]])
+    await event.edit(msg, buttons=[[Button.inline(get_store_buttons("bulk")["cancel"], "cancel_action")]])
 
 async def process_bulk_sessions(event, uid, qty, state, final_cost):
     country, year, price = state['country'], int(state['year']), int(state['price'])
@@ -1545,6 +1586,7 @@ async def admin_panel_handler(event):
         r5.extend([Button.inline("Discount", "adm_discount"), Button.inline("Ref %", "adm_refpct")])
         btns.append(r5)
         btns.append([Button.inline("📝 Set Welcome Msg", "adm_welcome"), Button.inline("🖼️ Banner Images", "adm_banner")])
+        btns.append([Button.inline("📝 Store Messages", "adm_store_messages"), Button.inline("⚙️ Store Buttons", "adm_store_buttons")])
         btns.append([Button.inline("Support URL", "adm_supporturl"), Button.inline("Payments", "adm_payments")])
         btns.append([Button.inline("Set USDT Rate", "adm_usdtrate")])
         btns.append([Button.inline("Backup Users", "adm_backupusr"), Button.inline("Restore Users", "adm_restoreusr")])
@@ -1921,6 +1963,53 @@ async def banner_manager_menu(event):
     ]
     await event.edit(f"🖼️ <b>Banner Images</b>\n\nStatus: {status}\nBanner: {banner_status}", buttons=btns)
 
+async def store_settings_menu(event, flow):
+    name = "Account" if flow == "single" else "Sessions"
+    key = "account" if flow == "single" else "sessions"
+    preview_label = "👁 Preview Account Store" if flow == "single" else "👁 Preview Sessions Store"
+    buttons = [
+        [Button.inline("✏️ Edit Message", f"adm_store_msg|{flow}"), Button.inline(preview_label, f"adm_store_preview|{flow}")],
+        [Button.inline("🖼 Set Banner", f"adm_store_banner|{flow}"), Button.inline("👁 Preview Banner", f"adm_store_banner_preview|{flow}")],
+        [Button.inline("🗑 Remove Banner", f"adm_store_banner_delete|{flow}")],
+        [Button.inline("↩️ Back", "adm_store_messages")]
+    ]
+    return await event.edit(
+        f"🛒 <b>{name} Store</b>\n\n"
+        f"Message: {'customized' if get_setting(f'{key}_store_message') else 'default'}\n"
+        f"Banner: {'configured' if get_setting(store_banner_key(flow)) else 'not configured'}",
+        buttons=buttons
+    )
+
+async def store_messages_menu(event):
+    return await event.edit(
+        "📝 <b>Store Messages</b>\n\nChoose the store to configure.",
+        buttons=[[Button.inline("🛒 Buy Account Message", "adm_store_config|single")],
+                 [Button.inline("🔐 Buy Sessions Message", "adm_store_config|bulk")],
+                 [Button.inline("↩️ Back", "adm_adminmain")]]
+    )
+
+async def store_buttons_menu(event):
+    return await event.edit(
+        "⚙️ <b>Store Buttons</b>\n\nChoose the store whose labels you want to edit.",
+        buttons=[[Button.inline("🛒 Account Buttons", "adm_store_btns|single")],
+                 [Button.inline("🔐 Sessions Buttons", "adm_store_btns|bulk")],
+                 [Button.inline("↩️ Back", "adm_adminmain")]]
+    )
+
+async def store_button_editor(event, flow):
+    name = "Account" if flow == "single" else "Sessions"
+    labels = get_store_buttons(flow)
+    rows = [[Button.inline(f"✏️ {key}: {label[:18]}", f"adm_store_btn|{flow}|{key}")] for key, label in labels.items()]
+    rows.append([Button.inline("↩️ Back", "adm_store_buttons")])
+    return await event.edit(f"⚙️ <b>{name} Store Buttons</b>\n\nSelect a label to edit.", buttons=rows)
+
+async def preview_store(event, flow):
+    class PreviewEvent:
+        sender_id = event.sender_id
+        chat_id = event.chat_id
+    await render_account_store(PreviewEvent(), flow, 1, send_banner=True)
+    return await event.answer("Preview sent.", alert=True)
+
 async def admin_actions(event):
     data_full = event.data.decode()
     if not data_full.startswith("adm_"): return
@@ -2088,6 +2177,57 @@ async def admin_actions(event):
         db.commit()
         await event.answer("User status updated.", alert=True)
         return await render_user_management(event, target_id)
+
+    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "store_messages", "store_buttons"} or action_data.startswith(("store_config|", "store_msg|", "store_preview|", "store_banner", "store_btns|", "store_btn|")):
+        if not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
+            return await event.answer("Not authorized.", alert=True)
+
+    if action_data == "store_messages":
+        return await store_messages_menu(event)
+    if action_data == "store_buttons":
+        return await store_buttons_menu(event)
+    if action_data.startswith("store_config|"):
+        flow = action_data.split("|", 1)[1]
+        if flow not in {"single", "bulk"}: return await event.answer("Invalid store.", alert=True)
+        return await store_settings_menu(event, flow)
+    if action_data.startswith("store_msg|"):
+        flow = action_data.split("|", 1)[1]
+        admin_content_state[uid] = {"type": "store_message", "flow": flow}
+        return await event.edit(
+            "📝 <b>Send the complete store message.</b>\n"
+            "HTML formatting is supported. Use {rate}, {available}, {products}, and {page} for dynamic values.",
+            buttons=[[Button.inline("↩️ Cancel", f"adm_store_config|{flow}")]]
+        )
+    if action_data.startswith("store_preview|"):
+        flow = action_data.split("|", 1)[1]
+        return await preview_store(event, flow)
+    if action_data.startswith("store_banner|"):
+        flow = action_data.split("|", 1)[1]
+        admin_content_state[uid] = {"type": "store_banner", "flow": flow}
+        return await event.edit("🖼 <b>Send the store banner image/photo.</b>", buttons=[[Button.inline("↩️ Cancel", f"adm_store_config|{flow}")]])
+    if action_data.startswith("store_banner_preview|"):
+        flow = action_data.split("|", 1)[1]
+        banner = get_banner_reference(get_setting(store_banner_key(flow)))
+        if not banner: return await event.answer("No banner configured.", alert=True)
+        try:
+            await bot.send_file(uid, banner)
+            return await event.answer("Preview sent.", alert=True)
+        except Exception:
+            return await event.answer("Banner reference expired. Upload it again.", alert=True)
+    if action_data.startswith("store_banner_delete|"):
+        flow = action_data.split("|", 1)[1]
+        delete_setting(store_banner_key(flow))
+        await event.answer("Banner removed.", alert=True)
+        return await store_settings_menu(event, flow)
+    if action_data.startswith("store_btns|"):
+        flow = action_data.split("|", 1)[1]
+        return await store_button_editor(event, flow)
+    if action_data.startswith("store_btn|"):
+        parts = action_data.split("|")
+        if len(parts) != 3 or parts[1] not in {"single", "bulk"} or parts[2] not in get_store_buttons(parts[1]):
+            return await event.answer("Invalid store button.", alert=True)
+        admin_content_state[uid] = {"type": "store_button", "flow": parts[1], "key": parts[2]}
+        return await event.edit(f"✏️ <b>Send the new label for {parts[2]}.</b>", buttons=[[Button.inline("↩️ Cancel", f"adm_store_btns|{parts[1]}")]])
 
     if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle"} and not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         return await event.answer("Not authorized.", alert=True)
@@ -2575,6 +2715,32 @@ async def handle_all_messages(e):
             if text.strip().lower() == "/cancel":
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Cancelled.")
+            if isinstance(content_type, dict) and content_type.get("type") == "store_message":
+                if not text.strip():
+                    return await e.reply("❌ Store message cannot be empty.")
+                set_setting(f"{'account' if content_type['flow'] == 'single' else 'sessions'}_store_message", text)
+                flow = content_type["flow"]
+                admin_content_state.pop(uid, None)
+                return await e.reply("✅ Store message saved.", buttons=[[Button.inline("↩️ Back", f"adm_store_config|{flow}")]])
+            if isinstance(content_type, dict) and content_type.get("type") == "store_button":
+                label = text.strip()
+                if not label or len(label.encode("utf-8")) > 60:
+                    return await e.reply("❌ Enter a non-empty label up to 60 bytes.")
+                flow, button_key = content_type["flow"], content_type["key"]
+                labels = get_store_buttons(flow)
+                labels[button_key] = label
+                set_setting(f"{'account' if flow == 'single' else 'sessions'}_button_labels", json.dumps(labels, ensure_ascii=False))
+                admin_content_state.pop(uid, None)
+                return await e.reply("✅ Button label saved.", buttons=[[Button.inline("↩️ Back", f"adm_store_btns|{flow}")]])
+            if isinstance(content_type, dict) and content_type.get("type") == "store_banner":
+                if not e.photo:
+                    return await e.reply("❌ Please send a Telegram photo.")
+                photo = e.photo
+                reference = {"id": photo.id, "access_hash": photo.access_hash, "file_reference": photo.file_reference.hex()}
+                set_setting(store_banner_key(content_type["flow"]), json.dumps(reference))
+                flow = content_type["flow"]
+                admin_content_state.pop(uid, None)
+                return await e.reply("✅ Store banner saved.", buttons=[[Button.inline("↩️ Back", f"adm_store_config|{flow}")]])
             if isinstance(content_type, dict) and content_type.get("type") == "general_setting":
                 name = content_type["name"]
                 value = text.strip()
@@ -2806,7 +2972,7 @@ async def handle_callback_query(e):
             if get_product_stock(product) == 0:
                 return await e.edit(
                     f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.",
-                    buttons=[[Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]]
+                    buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]]
                 )
             if flow == "single":
                 await confirm_purchase(e, product["country"], product["year"], str(product["price"]))
