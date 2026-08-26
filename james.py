@@ -18,6 +18,7 @@ from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError, 
     MessageNotModifiedError,
+    FloodWaitError,
     UserNotParticipantError,
     ChatAdminRequiredError
 )
@@ -242,6 +243,8 @@ user_spam_cooldown = {}
 session_buy_state = {}  
 custom_dep_amt = {}     
 pending_utr = {}        
+broadcast_drafts = {}
+broadcast_jobs = {}
 
 user_locks = {}
 
@@ -412,6 +415,78 @@ def set_setting(key, value):
 def delete_setting(key):
     cur.execute("DELETE FROM settings WHERE key=?", (key,))
     db.commit()
+
+async def send_broadcast_content(recipient_id, draft):
+    message = draft["message"]
+    kwargs = {"parse_mode": "html"}
+    if message.media:
+        kwargs["file"] = message.media
+        return await bot.send_message(recipient_id, draft["caption"], buttons=draft["buttons"], **kwargs)
+    return await bot.send_message(recipient_id, draft["text"], buttons=draft["buttons"], **kwargs)
+
+async def send_broadcast_preview(admin_id, draft):
+    message = draft["message"]
+    buttons = [
+        [Button.inline("✅ Confirm Send", f"adm_bcast_confirm|{admin_id}"), Button.inline("❌ Cancel", f"adm_bcast_cancel|{admin_id}")]
+    ]
+    if message.media:
+        return await bot.send_message(admin_id, draft["caption"], file=message.media, buttons=buttons, parse_mode="html")
+    return await bot.send_message(admin_id, draft["text"], buttons=buttons, parse_mode="html")
+
+async def run_broadcast(admin_id, chat_id, draft):
+    users = cur.execute("SELECT user_id FROM users").fetchall()
+    total = len(users)
+    sent = failed = blocked = 0
+    progress_message = await bot.send_message(
+        chat_id,
+        f"{P_TG} <b>Broadcast in progress...</b>\n\n👥 Total: {total}\n✅ Sent: 0\n❌ Failed: 0\n🚫 Blocked/Deactivated: 0\n⏳ Remaining: {total}",
+        buttons=[[Button.inline("🛑 Cancel Broadcast", f"adm_bcast_cancel|{admin_id}")]]
+    )
+    job = {"cancelled": False, "progress_message": progress_message}
+    broadcast_jobs[admin_id] = job
+    last_update = 0.0
+    try:
+        for index, (user_id,) in enumerate(users, start=1):
+            if job["cancelled"]:
+                break
+            try:
+                await send_broadcast_content(int(user_id), draft)
+                sent += 1
+            except FloodWaitError as error:
+                await asyncio.sleep(error.seconds)
+                try:
+                    await send_broadcast_content(int(user_id), draft)
+                    sent += 1
+                except Exception as retry_error:
+                    failed += 1
+                    if retry_error.__class__.__name__ in {"UserBlockedError", "PeerIdInvalidError", "ChatWriteForbiddenError"}:
+                        blocked += 1
+            except Exception as error:
+                failed += 1
+                if error.__class__.__name__ in {"UserBlockedError", "PeerIdInvalidError", "ChatWriteForbiddenError"}:
+                    blocked += 1
+
+            now = time.monotonic()
+            if now - last_update >= 2 or index == total:
+                last_update = now
+                try:
+                    await progress_message.edit(
+                        f"{P_TG} <b>Broadcast in progress...</b>\n\n👥 Total: {total}\n✅ Sent: {sent}\n❌ Failed: {failed}\n🚫 Blocked/Deactivated: {blocked}\n⏳ Remaining: {total - index}",
+                        buttons=[[Button.inline("🛑 Cancel Broadcast", f"adm_bcast_cancel|{admin_id}")]]
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(0.1)
+    finally:
+        broadcast_jobs.pop(admin_id, None)
+        broadcast_drafts.pop(admin_id, None)
+        cancelled = job["cancelled"]
+        title = "Broadcast Cancelled" if cancelled else "Broadcast Complete"
+        await bot.send_message(
+            chat_id,
+            f"{P_TG} <b>{title}</b>\n\n👥 Total: {total}\n✅ Sent: {sent}\n❌ Failed: {failed}\n🚫 Blocked/Deactivated: {blocked}",
+            buttons=[[Button.inline("◀️ Back", "adm_adminmain")]]
+        )
 
 def get_default_welcome(uid, pct, bot_username):
     ref_line = (
@@ -1747,6 +1822,33 @@ async def admin_actions(event):
         class FakeEvent: chat_id = chat; sender_id = uid
         return await admin_panel_handler(FakeEvent())
 
+    if action_data.startswith("bcast_confirm|"):
+        if not has_perm(uid, 'p_stats'):
+            return await event.answer("Not authorized.", alert=True)
+        owner_id = int(action_data.split("|", 1)[1])
+        if owner_id != uid or owner_id not in broadcast_drafts:
+            return await event.answer("Broadcast draft not found or expired.", alert=True)
+        if owner_id in broadcast_jobs:
+            return await event.answer("Broadcast is already running.", alert=True)
+        draft = broadcast_drafts[owner_id]
+        await event.answer("Broadcast started.", alert=True)
+        asyncio.create_task(run_broadcast(owner_id, chat, draft))
+        return
+
+    if action_data.startswith("bcast_cancel|"):
+        if not has_perm(uid, 'p_stats'):
+            return await event.answer("Not authorized.", alert=True)
+        owner_id = int(action_data.split("|", 1)[1])
+        if owner_id != uid:
+            return await event.answer("Not authorized.", alert=True)
+        job = broadcast_jobs.get(owner_id)
+        if job:
+            job["cancelled"] = True
+            return await event.answer("Cancellation requested.", alert=True)
+        broadcast_drafts.pop(owner_id, None)
+        await event.answer("Broadcast cancelled.", alert=True)
+        return await event.edit("❌ <b>Broadcast cancelled.</b>", buttons=[[Button.inline("◀️ Back", "adm_adminmain")]])
+
     if action_data in {"maintenance", "general"}:
         if not has_perm(uid, 'p_settings'):
             return await event.answer("Not authorized.", alert=True)
@@ -2212,20 +2314,20 @@ async def admin_actions(event):
                 await conv.send_message(f"{P_YES} Support URL updated.")
 
             elif action_data == "bcast" and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
-                txt = (await get_reply(f"{P_DOC} <b>Message (Supports HTML & tg-emoji tags):</b>")).text
+                message = await get_reply(f"{P_DOC} <b>Send the message or media to broadcast.</b>\nText, photo, video, and document captions are preserved.\nSupports HTML & tg-emoji tags.")
+                if not message.text and not message.media:
+                    return await conv.send_message(f"{P_NO} Empty messages cannot be broadcast.")
                 btn_name = (await get_reply(f"🔘 <b>Button Name (or 'skip'):</b>")).text
                 url = (await get_reply("🔗 <b>URL:</b>")).text if btn_name.lower() != 'skip' else None
                 btns = [[Button.url(btn_name, url)]] if url else None
-                users = cur.execute("SELECT user_id FROM users").fetchall()
-                s, f = 0, 0
-                await conv.send_message(f"{P_TG} Broadcasting...")
-                for (u_id,) in users:
-                    try: 
-                        await bot.send_message(int(u_id), txt, buttons=btns, parse_mode='html')
-                        s += 1
-                    except: f += 1
-                    await asyncio.sleep(0.1) 
-                await conv.send_message(f"{P_YES} Done! Sent: {s} | Failed: {f}")
+                broadcast_drafts[uid] = {
+                    "message": message,
+                    "text": message.text or "",
+                    "caption": message.message or message.text or "",
+                    "buttons": btns
+                }
+                await send_broadcast_preview(uid, broadcast_drafts[uid])
+                await conv.send_message(f"{P_EYE} Preview sent. Confirm or cancel it using the buttons below.")
 
             elif action_data == "discount" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
