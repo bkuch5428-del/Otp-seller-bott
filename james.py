@@ -237,6 +237,7 @@ waiting_proof = {}
 deposit_input = {} 
 admin_dep_state = {}    
 admin_content_state = {}
+admin_user_state = {}
 user_spam_cooldown = {} 
 session_buy_state = {}  
 custom_dep_amt = {}     
@@ -1359,6 +1360,140 @@ async def manage_admins_menu(event):
             [Button.inline("Back", "adm_adminmain")]]
     await event.edit(msg, buttons=btns)
 
+async def render_user_management(event, target_id):
+    row = cur.execute(
+        "SELECT user_id, balance, referred_by, total_deposited, joined_date, banned, discount "
+        "FROM users WHERE user_id=?", (target_id,)
+    ).fetchone()
+    if not row:
+        return await event.edit(f"{P_NO} <b>User not found.</b>", buttons=[[Button.inline("Back", "adm_adminmain")]])
+
+    user_id, balance, referred_by, deposited, joined, banned, discount = row
+    username = "Not available"
+    name = "Not available"
+    try:
+        telegram_user = await bot.get_entity(int(user_id))
+        username = f"@{html.escape(telegram_user.username)}" if telegram_user.username else "No username"
+        name = html.escape(" ".join(filter(None, [telegram_user.first_name, telegram_user.last_name]))) or "No name"
+    except Exception:
+        pass
+
+    order_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id=?", (user_id,)).fetchone()
+    deposit_row = cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE user_id=? AND status='approved'", (user_id,)
+    ).fetchone()
+    referral_count = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,)).fetchone()[0]
+    order_count, spent = order_row
+    approved_count, approved_total = deposit_row
+
+    msg = (f"{P_ACC} <b>USER MANAGEMENT</b>\n\n"
+           f"{P_ID} Telegram ID: <code>{user_id}</code>\n"
+           f"👤 Username: <b>{username}</b>\n"
+           f"🪪 Name: <b>{name}</b>\n"
+           f"{P_MONEY} Balance: <b>{P_INR}{balance}</b>\n"
+           f"{P_CARD} Deposited: <b>{P_INR}{deposited}</b> ({approved_count} approved, {P_INR}{approved_total})\n"
+           f"{P_CART} Orders: <b>{order_count}</b> ({P_INR}{spent} spent)\n"
+           f"{P_USERS} Referred by: <code>{referred_by if referred_by else 'None'}</code>\n"
+           f"{P_USERS} Referrals: <b>{referral_count}</b>\n"
+           f"{P_CAL} Joined: <b>{joined}</b>\n"
+           f"{P_GIFT} Discount: <b>{discount}%</b>\n"
+           f"{P_OFF} Status: <b>{'Banned' if banned else 'Active'}</b>")
+
+    buttons = []
+    if has_perm(event.sender_id, 'p_bal'):
+        buttons.append([Button.inline("💰 Change Balance", f"adm_um_bal|{user_id}")])
+        if banned:
+            buttons.append([Button.inline("✅ Unban User", f"adm_um_ban|{user_id}|0")])
+        else:
+            buttons.append([Button.inline("🚫 Ban User", f"adm_um_ban|{user_id}|1")])
+    buttons.append([Button.inline("Back to Admin", "adm_adminmain")])
+    await event.edit(msg, buttons=buttons)
+
+async def start_user_search(event, action):
+    if not (has_perm(event.sender_id, 'p_stats') or has_perm(event.sender_id, 'p_bal')):
+        return await event.answer("Not authorized.", alert=True)
+    async with bot.conversation(event.chat_id, timeout=180) as conv:
+        try:
+            await conv.send_message(
+                f"{P_ACC} <b>Enter Telegram numeric user ID:</b>\n\n"
+                f"Search by username is unavailable because usernames are not stored in the database.\n"
+                f"<i>Type /cancel to abort.</i>"
+            )
+            response = await conv.get_response()
+            value = response.text.strip()
+            if value.lower() == "/cancel":
+                return await conv.send_message("✅ Cancelled.")
+            if not value.isdigit() or int(value) <= 0:
+                return await conv.send_message(f"{P_NO} Enter a valid numeric Telegram user ID.")
+            target_id = int(value)
+            if not cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
+                return await conv.send_message(f"{P_NO} <b>User not found.</b>")
+            if action == "balance":
+                await conv.send_message(
+                    f"{P_MONEY} <b>Enter balance change for <code>{target_id}</code>:</b>\n"
+                    f"Use a positive number to increase or a negative number to decrease.\n"
+                    f"<i>Type /cancel to abort.</i>"
+                )
+                amount_text = (await conv.get_response()).text.strip()
+                if amount_text.lower() == "/cancel":
+                    return await conv.send_message("✅ Cancelled.")
+                if not re.fullmatch(r"[+-]?\d+", amount_text) or int(amount_text) == 0:
+                    return await conv.send_message(f"{P_NO} Enter a non-zero whole number, such as <code>500</code> or <code>-100</code>.")
+                amount = int(amount_text)
+            else:
+                amount = None
+            class ConversationEvent:
+                sender_id = event.sender_id
+                async def edit(self, text, buttons):
+                    await conv.send_message(text, buttons=buttons)
+            if amount is None:
+                await render_user_management(ConversationEvent(), target_id)
+            else:
+                await confirm_balance_change(ConversationEvent(), target_id, amount)
+        except asyncio.TimeoutError:
+            await conv.send_message(f"{P_NO} Timed out. Please try again.")
+
+async def confirm_balance_change(event, target_id, amount):
+    row = cur.execute("SELECT balance FROM users WHERE user_id=?", (target_id,)).fetchone()
+    if not row:
+        return await event.answer("User not found.", alert=True)
+    new_balance = row[0] + amount
+    if new_balance < 0:
+        return await event.answer("This change would make the balance negative.", alert=True)
+    action = "increase" if amount > 0 else "decrease"
+    admin_user_state[event.sender_id] = {"target_id": target_id, "amount": amount}
+    await event.edit(
+        f"{P_WARN} <b>Confirm balance change</b>\n\nUser: <code>{target_id}</code>\n"
+        f"Current: <b>{P_INR}{row[0]}</b>\nChange: <b>{action} {P_INR}{abs(amount)}</b>\n"
+        f"New balance: <b>{P_INR}{new_balance}</b>",
+        buttons=[
+            [Button.inline("✅ Confirm", f"adm_um_balcf|{target_id}"), Button.inline("❌ Cancel", f"adm_um|{target_id}")]
+        ]
+    )
+
+async def start_balance_for_user(event, target_id):
+    if not cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
+        return await event.answer("User not found.", alert=True)
+    async with bot.conversation(event.chat_id, timeout=180) as conv:
+        try:
+            await conv.send_message(
+                f"{P_MONEY} <b>Enter balance change for <code>{target_id}</code>:</b>\n"
+                f"Use a positive number to increase or a negative number to decrease.\n"
+                f"<i>Type /cancel to abort.</i>"
+            )
+            amount_text = (await conv.get_response()).text.strip()
+            if amount_text.lower() == "/cancel":
+                return await conv.send_message("✅ Cancelled.")
+            if not re.fullmatch(r"[+-]?\d+", amount_text) or int(amount_text) == 0:
+                return await conv.send_message(f"{P_NO} Enter a non-zero whole number, such as <code>500</code> or <code>-100</code>.")
+            class ConversationEvent:
+                sender_id = event.sender_id
+                async def edit(self, text, buttons):
+                    await conv.send_message(text, buttons=buttons)
+            await confirm_balance_change(ConversationEvent(), target_id, int(amount_text))
+        except asyncio.TimeoutError:
+            await conv.send_message(f"{P_NO} Timed out. Please try again.")
+
 async def edit_admin_menu(event, target_id):
     row = cur.execute("SELECT p_add_stock, p_manage_stock, p_stats, p_bal, p_settings FROM admins WHERE user_id=?", (target_id,)).fetchone()
     if not row: return await event.answer("Admin not found", alert=True)
@@ -1478,6 +1613,69 @@ async def admin_actions(event):
         await event.delete()
         class FakeEvent: chat_id = chat; sender_id = uid
         return await admin_panel_handler(FakeEvent())
+
+    if action_data in {"userinfo", "bal", "ban"}:
+        required_perm = 'p_stats' if action_data == "userinfo" else 'p_bal'
+        if not has_perm(uid, required_perm):
+            return await event.answer("Not authorized.", alert=True)
+        return await start_user_search(event, "balance" if action_data == "bal" else "info")
+
+    if action_data.startswith("um|"):
+        if not (has_perm(uid, 'p_stats') or has_perm(uid, 'p_bal')):
+            return await event.answer("Not authorized.", alert=True)
+        return await render_user_management(event, int(action_data.split("|", 1)[1]))
+
+    if action_data.startswith("um_bal|"):
+        if not has_perm(uid, 'p_bal'):
+            return await event.answer("Not authorized.", alert=True)
+        target_id = int(action_data.split("|", 1)[1])
+        return await start_balance_for_user(event, target_id)
+
+    if action_data.startswith("um_balcf|"):
+        if not has_perm(uid, 'p_bal'):
+            return await event.answer("Not authorized.", alert=True)
+        target_id = int(action_data.split("|", 1)[1])
+        pending = admin_user_state.pop(uid, None)
+        if not pending or pending.get("target_id") != target_id:
+            return await event.answer("This confirmation has expired.", alert=True)
+        amount = pending["amount"]
+        cur.execute("UPDATE users SET balance=balance+? WHERE user_id=? AND balance+? >= 0", (amount, target_id, amount))
+        if cur.rowcount != 1:
+            db.rollback()
+            return await event.answer("Balance change was not applied.", alert=True)
+        db.commit()
+        await event.answer("Balance updated.", alert=True)
+        return await render_user_management(event, target_id)
+
+    if action_data.startswith("um_ban|"):
+        if not has_perm(uid, 'p_bal'):
+            return await event.answer("Not authorized.", alert=True)
+        _, target_text, desired_text = action_data.split("|")
+        target_id, desired = int(target_text), int(desired_text)
+        row = cur.execute("SELECT banned FROM users WHERE user_id=?", (target_id,)).fetchone()
+        if not row:
+            return await event.answer("User not found.", alert=True)
+        if row[0] != desired:
+            return await render_user_management(event, target_id)
+        admin_user_state[uid] = {"ban_target": target_id, "ban_value": desired}
+        verb = "ban" if desired else "unban"
+        return await event.edit(
+            f"{P_WARN} <b>Confirm {verb} for user <code>{target_id}</code>?</b>",
+            buttons=[[Button.inline("✅ Confirm", f"adm_um_bancf|{target_id}|{desired}"), Button.inline("❌ Cancel", f"adm_um|{target_id}")]]
+        )
+
+    if action_data.startswith("um_bancf|"):
+        if not has_perm(uid, 'p_bal'):
+            return await event.answer("Not authorized.", alert=True)
+        _, target_text, desired_text = action_data.split("|")
+        target_id, desired = int(target_text), int(desired_text)
+        pending = admin_user_state.pop(uid, None)
+        if not pending or pending.get("ban_target") != target_id or pending.get("ban_value") != desired:
+            return await event.answer("This confirmation has expired.", alert=True)
+        cur.execute("UPDATE users SET banned=? WHERE user_id=?", (desired, target_id))
+        db.commit()
+        await event.answer("User status updated.", alert=True)
+        return await render_user_management(event, target_id)
 
     if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle"} and not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         return await event.answer("Not authorized.", alert=True)
@@ -1612,30 +1810,6 @@ async def admin_actions(event):
                 cur.execute("INSERT OR REPLACE INTO custom_countries (code, name, flag) VALUES (?,?,?)", (code, name, flag))
                 db.commit()
                 await conv.send_message(f"{P_YES} <b>Custom Country Added Successfully!</b>\n{flag} {name} (+{code})\n\n<i>It will now automatically be recognized when adding stock!</i>")
-
-            elif action_data == "userinfo" and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
-                t_uid = int((await get_reply(f"{P_ACC} <b>Enter User ID:</b>")).text)
-                u_row = cur.execute("SELECT balance, total_deposited, joined_date, banned, discount FROM users WHERE user_id=?", (t_uid,)).fetchone()
-                if not u_row: return await conv.send_message(f"{P_NO} User not found.")
-                
-                o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE user_id=?", (t_uid,)).fetchone()
-                up_row = cur.execute("SELECT SUM(amount) FROM upi_orders WHERE user_id=? AND status='success'", (t_uid,)).fetchone()
-                
-                bal, dep, joined, is_banned, disc = u_row
-                o_count = o_row[0] if o_row else 0
-                o_spent = o_row[1] if o_row and o_row[1] else 0
-                u_upi = up_row[0] if up_row and up_row[0] else 0
-                
-                msg = (f"{P_ACC} <b>USER INFO:</b> <code>{t_uid}</code>\n\n"
-                       f"{P_MONEY} Balance: {P_INR}{bal}\n"
-                       f"{P_CARD} Total Deposited: {P_INR}{dep}\n"
-                       f"{P_UPI} UPI Deposited: {P_INR}{u_upi}\n"
-                       f"{P_CART} Total Orders: {o_count}\n"
-                       f"{P_USDT} Total Spent: {P_INR}{o_spent}\n"
-                       f"{P_GIFT} Discount: {disc}%\n"
-                       f"{P_CAL} Joined: {joined}\n"
-                       f"{P_OFF} Banned: {'Yes' if is_banned else 'No'}")
-                await conv.send_message(msg)
 
             elif action_data == "addadmin" and uid in ADMIN_IDS:
                 new_ad = int((await get_reply(f"{P_ACC} <b>Enter User ID for new Admin:</b>")).text)
@@ -1866,12 +2040,6 @@ async def admin_actions(event):
                     await asyncio.sleep(0.1) 
                 await conv.send_message(f"{P_YES} Done! Sent: {s} | Failed: {f}")
 
-            elif action_data == "bal" and (uid in ADMIN_IDS or has_perm(uid, 'p_bal')):
-                t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
-                amt = int((await get_reply(f"{P_MONEY} <b>Amount (Negative to deduct):</b>")).text)
-                update_balance(t_uid, amt)
-                await conv.send_message(f"{P_YES} Added {P_INR}{amt} to {t_uid}.")
-                
             elif action_data == "discount" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
                 pct = int((await get_reply(f"{P_GIFT} <b>Discount % (0 to remove):</b>")).text)
@@ -1906,15 +2074,6 @@ async def admin_actions(event):
                 db.commit()
                 os.remove("temp_restore.csv")
                 await conv.send_message(f"{P_YES} Restored {count} users.")
-
-            elif action_data == "ban" and (uid in ADMIN_IDS or has_perm(uid, 'p_bal')):
-                t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
-                is_ban = cur.execute("SELECT banned FROM users WHERE user_id=?", (t_uid,)).fetchone()
-                if not is_ban: return await conv.send_message(f"{P_NO} User not found.")
-                ns = 0 if is_ban[0] == 1 else 1
-                cur.execute("UPDATE users SET banned=? WHERE user_id=?", (ns, t_uid))
-                db.commit()
-                await conv.send_message(f"User {t_uid} is {'Banned 🚫' if ns == 1 else 'Unbanned ✅'}.")
 
         except ValueError: await conv.send_message(f"{P_NO} Cancelled.")
         except Exception as e: await conv.send_message(f"{P_NO} Error: {e}")
