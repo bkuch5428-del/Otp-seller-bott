@@ -356,6 +356,15 @@ def is_bot_online():
     res = cur.execute("SELECT value FROM settings WHERE key='bot_status'").fetchone()
     return res[0] == 'on' if res else True
 
+def is_maintenance_mode():
+    return get_setting("maintenance_enabled", "off") == "on"
+
+def get_maintenance_message():
+    return get_setting(
+        "maintenance_message",
+        "🛠 <b>Maintenance Mode</b>\n\nPlease try again later."
+    )
+
 def is_admin(uid):
     if uid in ADMIN_IDS:
         return True
@@ -376,6 +385,16 @@ def get_usdt_rate():
     res = cur.execute("SELECT value FROM settings WHERE key='usdt_rate'").fetchone()
     try: return float(res[0]) if res else float(DEFAULT_USDT_RATE)
     except: return float(DEFAULT_USDT_RATE)
+
+def get_auto_cancel_seconds():
+    try:
+        value = int(get_setting("auto_cancel_seconds", str(AUTO_CANCEL_SECONDS)))
+        return value if value >= 1 else AUTO_CANCEL_SECONDS
+    except (TypeError, ValueError):
+        return AUTO_CANCEL_SECONDS
+
+def get_terms_url():
+    return fix_url(get_setting("terms_url", TERMS_URL))
 
 def get_support_url():
     res = cur.execute("SELECT value FROM settings WHERE key='support_url'").fetchone()
@@ -592,7 +611,7 @@ def get_persistent_menu(uid):
 
 def get_terms_buttons():
     return [
-        [Button.url("📜 Read Terms & Conditions", fix_url(TERMS_URL))],
+        [Button.url("📜 Read Terms & Conditions", get_terms_url())],
         [Button.inline("✅ Accept", "tc_accept"), Button.inline("❌ Reject", "tc_reject")]
     ]
 
@@ -600,7 +619,7 @@ def get_support_buttons():
     buttons = [
         [Button.url(f"📩 @{SUPPORT_USERNAME_1}", f"https://t.me/{SUPPORT_USERNAME_1}")],
         [Button.url(f"📩 @{SUPPORT_USERNAME_2}", f"https://t.me/{SUPPORT_USERNAME_2}")],
-        [Button.url("📜 Terms & Conditions", fix_url(TERMS_URL))]
+        [Button.url("📜 Terms & Conditions", get_terms_url())]
     ]
     if JOIN_URLS and JOIN_URLS[0]:
         try:
@@ -1108,7 +1127,7 @@ async def auto_otp_task(phone):
     uid = order['uid']
     msg_id = order['msg_id']
     
-    while time.time() - start_time < AUTO_CANCEL_SECONDS:
+    while time.time() - start_time < get_auto_cancel_seconds():
         if phone not in active_orders: return 
         try:
             msgs = await client.get_messages(777000, limit=5)
@@ -1316,6 +1335,7 @@ async def admin_panel_handler(event):
     r1 = []
     if uid in ADMIN_IDS or has_perm(uid, 'p_add_stock'):
         r1.extend([Button.inline("Add Single Acc", "adm_addstock"), Button.inline("Add ZIP", "adm_addzip")])
+        btns.append([Button.inline("🛠 Maintenance Mode", "adm_maintenance"), Button.inline("⚙️ General Settings", "adm_general")])
     if r1: btns.append(r1)
 
     r2 = []
@@ -1351,6 +1371,36 @@ async def admin_panel_handler(event):
               f"{P_PKG} Available Stock: <b>{total_stock}</b>\n"
               f"{P_WAIT} Pending Deposits: <b>{pending_deposits}</b>")
     await bot.send_message(event.chat_id, header, buttons=btns)
+
+async def maintenance_menu(event):
+    enabled = is_maintenance_mode()
+    status = "🟢 Enabled" if enabled else "🔴 Disabled"
+    buttons = [
+        [Button.inline("🟢 Enable", "adm_maintenance_set|on"), Button.inline("🔴 Disable", "adm_maintenance_set|off")],
+        [Button.inline("✏️ Change Message", "adm_maintenance_message")],
+        [Button.inline("📊 Status", "adm_maintenance_status")],
+        [Button.inline("◀️ Back", "adm_adminmain")]
+    ]
+    await event.edit(
+        f"🛠 <b>Maintenance Mode</b>\n\nStatus: <b>{status}</b>\n\n"
+        f"Current message:\n{html.escape(get_maintenance_message())}",
+        buttons=buttons
+    )
+
+async def general_settings_menu(event):
+    msg = (f"⚙️ <b>General Settings</b>\n\n"
+           f"🔗 Support URL: <code>{html.escape(get_support_url())}</code>\n"
+           f"📜 Terms URL: <code>{html.escape(get_terms_url())}</code>\n"
+           f"💱 USDT rate: <b>{get_usdt_rate()}</b> INR\n"
+           f"⏱ Auto-cancel: <b>{get_auto_cancel_seconds()}</b> seconds")
+    buttons = [
+        [Button.inline("🔗 Support URL", "adm_setting_edit|support_url")],
+        [Button.inline("📜 Terms URL", "adm_setting_edit|terms_url")],
+        [Button.inline("💱 USDT Rate", "adm_setting_edit|usdt_rate")],
+        [Button.inline("⏱ Auto-cancel Seconds", "adm_setting_edit|auto_cancel_seconds")],
+        [Button.inline("◀️ Back", "adm_adminmain")]
+    ]
+    await event.edit(msg, buttons=buttons)
 
 async def manage_admins_menu(event):
     rows = cur.execute("SELECT user_id FROM admins").fetchall()
@@ -1613,6 +1663,72 @@ async def admin_actions(event):
         await event.delete()
         class FakeEvent: chat_id = chat; sender_id = uid
         return await admin_panel_handler(FakeEvent())
+
+    if action_data in {"maintenance", "general"}:
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        return await maintenance_menu(event) if action_data == "maintenance" else await general_settings_menu(event)
+
+    if action_data == "maintenance_status":
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        status = "enabled" if is_maintenance_mode() else "disabled"
+        return await event.answer(f"Maintenance mode is {status}.", alert=True)
+
+    if action_data.startswith("maintenance_set|"):
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        desired = action_data.split("|", 1)[1]
+        if desired not in {"on", "off"}:
+            return await event.answer("Invalid maintenance state.", alert=True)
+        admin_content_state[uid] = {"type": "maintenance_confirm", "value": desired}
+        verb = "enable" if desired == "on" else "disable"
+        return await event.edit(
+            f"⚠️ <b>Confirm {verb} maintenance mode?</b>",
+            buttons=[
+                [Button.inline("✅ Confirm", f"adm_maintenance_confirm|{desired}"), Button.inline("❌ Cancel", "adm_maintenance")]
+            ]
+        )
+
+    if action_data.startswith("maintenance_confirm|"):
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        desired = action_data.split("|", 1)[1]
+        pending = admin_content_state.get(uid)
+        if pending != {"type": "maintenance_confirm", "value": desired}:
+            return await event.answer("This confirmation has expired.", alert=True)
+        set_setting("maintenance_enabled", desired)
+        admin_content_state.pop(uid, None)
+        await event.answer("Maintenance mode updated.", alert=True)
+        return await maintenance_menu(event)
+
+    if action_data == "maintenance_message":
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        admin_content_state[uid] = "maintenance_message"
+        return await event.edit(
+            "✏️ <b>Send the new maintenance message.</b>\nHTML formatting is supported.",
+            buttons=[[Button.inline("◀️ Cancel", "adm_maintenance")]]
+        )
+
+    if action_data.startswith("setting_edit|"):
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        setting_name = action_data.split("|", 1)[1]
+        if setting_name not in {"support_url", "terms_url", "usdt_rate", "auto_cancel_seconds"}:
+            return await event.answer("Invalid setting.", alert=True)
+        admin_content_state[uid] = {"type": "general_setting", "name": setting_name}
+        labels = {
+            "support_url": "Support URL (http:// or https://)",
+            "terms_url": "Terms URL (http:// or https://)",
+            "usdt_rate": "USDT rate in INR (positive number)",
+            "auto_cancel_seconds": "Auto-cancel seconds (at least 1)"
+        }
+        return await event.edit(
+            f"⚙️ <b>Enter {labels[setting_name]}:</b>\n\n"
+            f"Current: <code>{html.escape(str(get_setting(setting_name, get_support_url() if setting_name == 'support_url' else get_terms_url() if setting_name == 'terms_url' else get_usdt_rate() if setting_name == 'usdt_rate' else get_auto_cancel_seconds())))}</code>",
+            buttons=[[Button.inline("◀️ Cancel", "adm_general")]]
+        )
 
     if action_data in {"userinfo", "bal", "ban"}:
         required_perm = 'p_stats' if action_data == "userinfo" else 'p_bal'
@@ -2088,8 +2204,8 @@ async def handle_start(e):
         ensure_user(uid)
         if is_user_banned(uid): return
 
-        if not is_bot_online() and not is_admin(uid):
-            return await e.respond(f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
+        if (not is_bot_online() or is_maintenance_mode()) and not is_admin(uid):
+            return await e.respond(get_maintenance_message() if is_maintenance_mode() else f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
         
         session_buy_state.pop(uid, None)
         deposit_input.pop(uid, None)
@@ -2128,8 +2244,8 @@ async def handle_all_messages(e):
         uid = e.sender_id
         if not uid: return
         if getattr(e, 'text', None) and e.text.startswith('/') and not (e.text.strip().lower() == '/cancel' and uid in admin_content_state): return
-        if not is_bot_online() and not is_admin(uid):
-            return await e.respond(f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
+        if (not is_bot_online() or is_maintenance_mode()) and not is_admin(uid):
+            return await e.respond(get_maintenance_message() if is_maintenance_mode() else f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
         
         ensure_user(uid)
         if is_user_banned(uid): return
@@ -2175,6 +2291,31 @@ async def handle_all_messages(e):
             if text.strip().lower() == "/cancel":
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Cancelled.")
+            if isinstance(content_type, dict) and content_type.get("type") == "general_setting":
+                name = content_type["name"]
+                value = text.strip()
+                try:
+                    if name in {"support_url", "terms_url"}:
+                        if not re.match(r"^https?://[^\s]+$", value, re.IGNORECASE):
+                            raise ValueError
+                    elif name == "usdt_rate":
+                        if float(value) <= 0:
+                            raise ValueError
+                        value = str(float(value))
+                    elif name == "auto_cancel_seconds":
+                        if not value.isdigit() or int(value) < 1:
+                            raise ValueError
+                    set_setting(name, value)
+                    admin_content_state.pop(uid, None)
+                    return await e.reply(f"✅ <b>{name}</b> saved.", buttons=[[Button.inline("Back", "adm_general")]])
+                except ValueError:
+                    return await e.reply("❌ Invalid value. Please try again or type /cancel.")
+            if content_type == "maintenance_message":
+                if not text.strip():
+                    return await e.reply("❌ Maintenance message cannot be empty.")
+                set_setting("maintenance_message", text.strip())
+                admin_content_state.pop(uid, None)
+                return await e.reply("✅ Maintenance message saved.", buttons=[[Button.inline("Back", "adm_maintenance")]])
             if content_type == "welcome":
                 if not text:
                     return await e.reply("❌ Welcome message cannot be empty.")
@@ -2308,8 +2449,11 @@ async def handle_all_messages(e):
 async def handle_callback_query(e):
     try:
         uid = e.sender_id
-        if not is_bot_online() and not is_admin(uid):
-            return await e.answer("⚙️ Bot is under maintenance.", alert=True)
+        if (not is_bot_online() or is_maintenance_mode()) and not is_admin(uid):
+            return await e.answer(
+                get_maintenance_message() if is_maintenance_mode() else "⚙️ Bot is under maintenance.",
+                alert=True
+            )
             
         ensure_user(uid)
         now = time.time()
