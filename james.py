@@ -1402,6 +1402,89 @@ async def general_settings_menu(event):
     ]
     await event.edit(msg, buttons=buttons)
 
+def get_stats_period(period):
+    periods = {
+        "today": ("Today", "date('now', 'start of day')"),
+        "week": ("This Week", "date('now', '-' || ((cast(strftime('%w', 'now') as integer) + 6) % 7) || ' days')"),
+        "month": ("This Month", "date('now', 'start of month')"),
+        "all": ("All Time", "NULL")
+    }
+    return periods.get(period, periods["all"])
+
+async def render_admin_stats(event, period="all"):
+    if not has_perm(event.sender_id, 'p_stats'):
+        return await event.answer("Not authorized.", alert=True)
+    label, since = get_stats_period(period)
+    date_filter = "" if period == "all" else " AND date >= " + since
+    user_filter = "" if period == "all" else " WHERE joined_date >= " + since
+
+    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    period_users = cur.execute("SELECT COUNT(*) FROM users" + user_filter).fetchone()[0]
+    banned_users = cur.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0]
+    total_balance = cur.execute("SELECT COALESCE(SUM(balance), 0) FROM users").fetchone()[0]
+    total_upi_revenue = get_setting("upi_revenue", "0")
+
+    deposit_row = cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE status='approved'" + date_filter
+    ).fetchone()
+    total_deposits = cur.execute(
+        "SELECT COALESCE(SUM(total_deposited), 0) FROM users"
+    ).fetchone()[0]
+    period_deposit_count, period_deposits = deposit_row
+
+    order_row = cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE 1=1" + date_filter
+    ).fetchone()
+    period_orders, period_sales = order_row
+    total_orders, total_sales = cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders"
+    ).fetchone()
+
+    referral_filter = "" if period == "all" else " AND joined_date >= " + since
+    total_referrals = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL").fetchone()[0]
+    period_referrals = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL" + referral_filter).fetchone()[0]
+    top_referrers = cur.execute(
+        "SELECT referred_by, COUNT(*) AS referrals FROM users "
+        "WHERE referred_by IS NOT NULL GROUP BY referred_by ORDER BY referrals DESC LIMIT 3"
+    ).fetchall()
+
+    available_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+    used_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=0").fetchone()[0]
+    pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
+    top_text = "Unavailable"
+    if top_referrers:
+        top_text = "\n".join(f"<code>{referrer}</code>: {count}" for referrer, count in top_referrers)
+
+    msg = (f"{P_STATS} <b>ADVANCED STATISTICS</b>\n"
+           f"📅 Period: <b>{label}</b>\n\n"
+           f"{P_USERS} <b>USERS</b>\n"
+           f"Total: <b>{total_users}</b> | In period: <b>{period_users}</b>\n"
+           f"Banned: <b>{banned_users}</b>\n\n"
+           f"{P_MONEY} <b>FINANCIAL</b>\n"
+           f"Total deposits: <b>{P_INR}{total_deposits}</b>\n"
+           f"In period: <b>{P_INR}{period_deposits}</b> ({period_deposit_count} approved)\n"
+           f"Total UPI revenue: <b>{P_INR}{html.escape(str(total_upi_revenue))}</b>\n"
+           f"Total sales/revenue: <b>{P_INR}{total_sales}</b>\n"
+           f"Period sales/revenue: <b>{P_INR}{period_sales}</b>\n\n"
+           f"{P_CART} <b>ORDERS / STOCK</b>\n"
+           f"Total orders: <b>{total_orders}</b> | In period: <b>{period_orders}</b>\n"
+           f"Pending deposits: <b>{pending_deposits}</b>\n"
+           f"Pending/completed/cancelled orders: <i>Unavailable (not stored)</i>\n"
+           f"Available stock: <b>{available_stock}</b>\n"
+           f"Used stock records: <b>{used_stock}</b>\n"
+           f"Overall user balance: <b>{P_INR}{total_balance}</b>\n\n"
+           f"{P_GIFT} <b>REFERRALS</b>\n"
+           f"Total referrals: <b>{total_referrals}</b> | In period: <b>{period_referrals}</b>\n"
+           f"Referral rewards issued: <i>Unavailable (not stored)</i>\n"
+           f"Top referrers:\n{top_text}")
+    buttons = [
+        [Button.inline("Today", "adm_statsp|today"), Button.inline("This Week", "adm_statsp|week")],
+        [Button.inline("This Month", "adm_statsp|month"), Button.inline("All Time", "adm_statsp|all")],
+        [Button.inline("🔄 Refresh", f"adm_statsp|{period}")],
+        [Button.inline("◀️ Back", "adm_adminmain")]
+    ]
+    await event.edit(msg, buttons=buttons)
+
 async def manage_admins_menu(event):
     rows = cur.execute("SELECT user_id FROM admins").fetchall()
     msg = f"{PE_CROWN} <b>Manage Sub-Admins</b>\n\n"
@@ -1848,22 +1931,10 @@ async def admin_actions(event):
         return
 
     elif action_data == "stats" and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
-        u_row = cur.execute("SELECT COUNT(*) FROM users").fetchone()
-        u = u_row[0] if u_row else 0
-        s_row = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()
-        s = s_row[0] if s_row else 0
-        r_row = cur.execute("SELECT value FROM settings WHERE key='upi_revenue'").fetchone()
-        r = r_row[0] if r_row else "0"
-        bal_row = cur.execute("SELECT SUM(balance) FROM users").fetchone()
-        total_bal = bal_row[0] if bal_row and bal_row[0] else 0
-        o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders").fetchone()
-        total_orders = o_row[0] if o_row else 0
-        total_spent = o_row[1] if o_row and o_row[1] else 0
-        
-        msg = (f"{P_STATS} <b>ADVANCED STATS</b>\n\n{P_USERS} <b>Total Users:</b> {u}\n{P_PKG} <b>Accounts in Stock:</b> {s}\n"
-               f"{P_MONEY} <b>Total UPI Revenue:</b> {P_INR}{r}\n\n{P_CARD} <b>Overall Users Balance:</b> {P_INR}{total_bal}\n"
-               f"{P_CART} <b>Total Accounts Sold:</b> {total_orders}\n{P_USDT} <b>Overall Sales Amount:</b> {P_INR}{total_spent}")
-        return await event.edit(msg, buttons=[[Button.inline("Back", "adm_adminmain")]])
+        return await render_admin_stats(event, "all")
+
+    elif action_data.startswith("statsp|") and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
+        return await render_admin_stats(event, action_data.split("|", 1)[1])
 
     elif action_data == "payments" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         btns = [
