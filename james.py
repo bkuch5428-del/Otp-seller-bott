@@ -241,6 +241,7 @@ admin_content_state = {}
 admin_user_state = {}
 user_spam_cooldown = {} 
 session_buy_state = {}  
+account_product_state = {}
 custom_dep_amt = {}     
 pending_utr = {}        
 broadcast_drafts = {}
@@ -1065,34 +1066,144 @@ async def submit_utr_handler(event, order_id):
             await conv.send_message("❌ Error processing your request. Please try again.")
 
 # ================= BUYING FLOW =================
-async def show_countries(event, flow, page=1):
-    limit = 10
-    offset = (page - 1) * limit
-    
-    total_row = cur.execute("SELECT COUNT(DISTINCT country_name) FROM stock WHERE available=1").fetchone()
-    total = total_row[0] if total_row else 0
-    rows = cur.execute("SELECT country_icon, country_name, COUNT(*) FROM stock WHERE available=1 GROUP BY country_name ORDER BY country_name ASC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
-        
-    if not rows and page == 1: 
-        err_msg = f"{P_NO} <b>Stock is Empty right now. Check back later!</b>"
-        if isinstance(event, events.CallbackQuery.Event): return await event.edit(err_msg)
-        else: return await event.respond(err_msg)
-    
-    title = f"{PE_LIGHTNING} <b>Bulk Sessions Menu</b>" if flow == 'bulk' else f"{PE_HEART} <b>Single Account Menu</b>"
-    msg = f"{title}\n\n{P_GLOBE} <b>Select a region below to view available numbers (Page {page}).</b>\n{P_USDT} Rate: 1 USDT = {P_INR}{get_usdt_rate()}\n\n"
-    
-    btns = []
-    for (i, n, c) in rows:
-        btns.append([Button.inline(f"{i} {n} ({c})", f"bc|{flow}|{n[:20]}")])
+def get_available_account_products():
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    dc_expression = "data_center" if "data_center" in columns else "NULL"
+    query = f"""
+        SELECT country_icon, country_name, category, account_year, price,
+               COUNT(*), MIN(phone), {dc_expression}
+        FROM stock
+        WHERE available=1
+        GROUP BY country_icon, country_name, category, account_year, price, {dc_expression}
+        ORDER BY country_name ASC, account_year DESC, price ASC
+    """
+    rows = cur.execute(query).fetchall()
+    return [
+        {
+            "icon": row[0] or "🌍",
+            "country": row[1] or "Unknown",
+            "category": row[2] or "Standard",
+            "year": row[3],
+            "price": int(row[4] or 0),
+            "stock": int(row[5] or 0),
+            "phone": row[6],
+            "dc": row[7]
+        }
+        for row in rows
+    ]
 
-    nav = []
-    if page > 1: nav.append(Button.inline("Prev", f"pg_c|{flow}|{page-1}"))
-    if offset + limit < total: nav.append(Button.inline("Next", f"pg_c|{flow}|{page+1}"))
-    if nav: btns.append(nav)
-    btns.append([Button.inline("Cancel", "cancel_action")])
-    
-    if isinstance(event, events.CallbackQuery.Event): await event.edit(msg, buttons=btns)
-    else: await event.respond(msg, buttons=btns)
+def get_product_stock(product):
+    row = cur.execute(
+        "SELECT COUNT(*) FROM stock WHERE available=1 AND country_name=? AND category=? AND account_year=? AND price=?",
+        (product["country"], product["category"], product["year"], product["price"])
+    ).fetchone()
+    return row[0] if row else 0
+
+def account_store_caption(products, page, total_pages, page_products):
+    if not products:
+        return (f"{P_CART} <b>ACCOUNT STORE</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n\n"
+                f"{P_PKG} No accounts are currently available.\n\n"
+                f"Please check again later.\n\n"
+                f"⬅️ Back")
+
+    lines = [
+        f"{P_CART} <b>ACCOUNT STORE</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "⚡ Select an account below to view details.",
+        "",
+        f"💱 Rate: 1 USDT = {P_INR}{get_usdt_rate():g}",
+        f"{P_PKG} Available: {sum(product['stock'] for product in products)} accounts",
+        "",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+    for product in page_products:
+        year_line = f" • {html.escape(str(product['year']))}" if product["year"] else ""
+        info_line = (f"🖥 DC {html.escape(str(product['dc']))}" if product["dc"] else "") + year_line
+        lines.extend([
+            "",
+            f"{product['icon']} <b>{html.escape(product['country'])}</b> — {html.escape(product['category'])}",
+            info_line,
+            f"💵 ${to_usd(product['price']):.2f} • {P_INR}{product['price']}",
+            f"{P_PKG} Stock: {product['stock']}"
+        ])
+    lines.append(f"\n📄 Page {page}/{total_pages}")
+    return "\n".join(lines)
+
+async def render_account_store(event, flow, page=1, send_banner=False):
+    limit = 10
+    products = get_available_account_products()
+    total_pages = max(1, (len(products) + limit - 1) // limit)
+    page = min(max(page, 1), total_pages)
+    page_products = products[(page - 1) * limit:page * limit]
+
+    uid = event.sender_id
+    account_product_state[uid] = {str(index): product for index, product in enumerate(page_products)}
+    product_buttons = []
+    for index, product in enumerate(page_products):
+        label = f"{product['icon']} {product['country']} {product['category']}"
+        if len(label) > 32:
+            label = label[:31] + "…"
+        product_buttons.append(Button.inline(label, f"prod|{flow}|{index}"))
+    buttons = [product_buttons[index:index + 2] for index in range(0, len(product_buttons), 2)]
+
+    if total_pages > 1:
+        navigation = []
+        if page > 1:
+            navigation.append(Button.inline("⬅️ Previous", f"shop|{flow}|{page - 1}"))
+        navigation.append(Button.inline(f"Page {page}/{total_pages}", "shop_noop"))
+        if page < total_pages:
+            navigation.append(Button.inline("Next ➡️", f"shop|{flow}|{page + 1}"))
+        buttons.append(navigation)
+    buttons.append([Button.inline("⬅️ Back", "shop_back")])
+
+    caption = account_store_caption(products, page, total_pages, page_products)
+    banner = get_banner_media() if get_setting("images_enabled", "off") == "on" else None
+    if send_banner and banner:
+        try:
+            await bot.send_file(event.chat_id, banner, caption=caption, buttons=buttons)
+            return
+        except Exception:
+            pass
+    if isinstance(event, events.CallbackQuery.Event):
+        await event.edit(caption, buttons=buttons)
+    else:
+        await event.respond(caption, buttons=buttons)
+
+async def show_product_details(event, flow, token):
+    product = account_product_state.get(event.sender_id, {}).get(token)
+    if not product:
+        return await event.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
+    stock = get_product_stock(product)
+    if stock == 0:
+        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]])
+        return
+
+    lines = [
+        f"{P_CART} <b>PRODUCT DETAILS</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"🌍 <b>Country:</b> {product['icon']} {html.escape(product['country'])}",
+        f"📌 <b>Type:</b> {html.escape(product['category'])}"
+    ]
+    if product["dc"]:
+        lines.append(f"🖥 <b>DC:</b> {html.escape(str(product['dc']))}")
+    if product["year"]:
+        lines.append(f"📅 <b>Year:</b> {html.escape(str(product['year']))}")
+    lines.extend([
+        "",
+        f"💵 <b>Price:</b> ${to_usd(product['price']):.2f}",
+        f"🇮🇳 <b>Price:</b> {P_INR}{product['price']}",
+        f"{P_PKG} <b>Available:</b> {stock}"
+    ])
+    buttons = [
+        [Button.inline("🛒 Buy Now", f"pbuy|{flow}|{token}")],
+        [Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]
+    ]
+    await event.edit("\n".join(lines), buttons=buttons)
+
+async def show_countries(event, flow, page=1):
+    return await render_account_store(event, flow, page, send_banner=not isinstance(event, events.CallbackQuery.Event))
 
 async def show_years(event, flow, country):
     rows = cur.execute("SELECT account_year, price, COUNT(*) FROM stock WHERE available=1 AND country_name LIKE ? GROUP BY account_year, price ORDER BY account_year DESC", (f"{country}%",)).fetchall()
@@ -2664,6 +2775,43 @@ async def handle_callback_query(e):
                 del pending_utr[uid]
             try: await e.edit(f"{P_NO} <b>Cancelled.</b>")
             except MessageNotModifiedError: pass
+
+        elif data.startswith("shop|"):
+            parts = data.split("|")
+            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
+                return await e.answer("Invalid shop page.", alert=True)
+            await show_countries(e, parts[1], int(parts[2]))
+
+        elif data == "shop_noop":
+            await e.answer("You are viewing this page.")
+
+        elif data == "shop_back":
+            account_product_state.pop(uid, None)
+            await send_main_menu(e, uid)
+
+        elif data.startswith("prod|"):
+            parts = data.split("|")
+            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
+                return await e.answer("Invalid product.", alert=True)
+            await show_product_details(e, parts[1], parts[2])
+
+        elif data.startswith("pbuy|"):
+            parts = data.split("|")
+            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
+                return await e.answer("Invalid product.", alert=True)
+            flow, token = parts[1], parts[2]
+            product = account_product_state.get(uid, {}).get(token)
+            if not product:
+                return await e.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
+            if get_product_stock(product) == 0:
+                return await e.edit(
+                    f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.",
+                    buttons=[[Button.inline("⬅️ Back to Accounts", f"shop|{flow}|1")]]
+                )
+            if flow == "single":
+                await confirm_purchase(e, product["country"], product["year"], str(product["price"]))
+            else:
+                await init_session_purchase(e, product["country"], product["year"], str(product["price"]))
 
         elif data.startswith("pg_c|"): 
             p = data.split("|")
