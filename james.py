@@ -11,6 +11,7 @@ import zipfile
 import shutil
 import html
 import json
+import hashlib
 from datetime import datetime
 from urllib.parse import quote
 
@@ -349,6 +350,13 @@ def update_database_schema():
         cur.execute("ALTER TABLE deposits ADD COLUMN utr TEXT")
         db.commit()
         logger.info("✅ Added utr column to deposits")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+    try:
+        cur.execute("ALTER TABLE stock ADD COLUMN data_center TEXT")
+        db.commit()
+        logger.info("✅ Added data_center column to stock")
     except sqlite3.OperationalError:
         pass  # Column already exists
 
@@ -1171,7 +1179,7 @@ def get_product_stock(product):
 
     if category:
         query += " AND COALESCE(category, '')=?"
-        params.insert(1, category)
+        params.append(category)
     else:
         query += " AND (COALESCE(category, '')='' OR category IS NULL)"
 
@@ -1184,6 +1192,24 @@ def get_product_stock(product):
 
     row = cur.execute(query, params).fetchone()
     return row[0] if row else 0
+
+
+def get_product_token(product):
+    identity = (
+        product.get("country") or "",
+        normalize_optional_text(product.get("category")),
+        product.get("dc") or "",
+        product.get("year"),
+        int(product.get("price") or 0),
+    )
+    return hashlib.sha256(json.dumps(identity, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()[:16]
+
+
+def resolve_product(token):
+    for product in get_available_account_products():
+        if get_product_token(product) == token:
+            return product
+    return None
 
 
 def format_store_product_line(product):
@@ -1240,12 +1266,11 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     page_products = products[(page - 1) * limit:page * limit]
 
     uid = event.sender_id
-    product_map = {str(index): product for index, product in enumerate(page_products)}
-    account_product_state[uid] = {"page": page, "products": product_map}
+    account_product_state[uid] = {"page": page}
     product_buttons = []
-    for index, product in enumerate(page_products):
+    for product in page_products:
         label = get_product_button_label(product)
-        product_buttons.append(Button.inline(label, f"prod|{flow}|{index}"))
+        product_buttons.append(Button.inline(label, f"prod|{flow}|{get_product_token(product)}"))
     buttons = [product_buttons[index:index + 2] for index in range(0, len(product_buttons), 2)]
 
     if total_pages > 1:
@@ -1273,15 +1298,11 @@ async def render_account_store(event, flow, page=1, send_banner=False):
 
 async def show_product_details(event, flow, token):
     state = account_product_state.get(event.sender_id, {})
-    if isinstance(state, dict) and "products" in state:
-        product_map = state.get("products", {})
-        page = state.get("page", 1)
-    else:
-        product_map = state
-        page = 1
-    product = product_map.get(token)
+    page = state.get("page", 1) if isinstance(state, dict) else 1
+    product = resolve_product(token)
     if not product:
-        return await event.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
+        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|{page}")]])
+        return
     stock = get_product_stock(product)
     if stock == 0:
         await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|{page}")]])
@@ -3116,20 +3137,21 @@ async def handle_callback_query(e):
 
         elif data.startswith("prod|"):
             parts = data.split("|")
-            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
+            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not re.fullmatch(r"[0-9a-f]{16}", parts[2]):
                 return await e.answer("Invalid product.", alert=True)
             await show_product_details(e, parts[1], parts[2])
 
         elif data.startswith("pbuy|"):
             parts = data.split("|")
-            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
+            if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not re.fullmatch(r"[0-9a-f]{16}", parts[2]):
                 return await e.answer("Invalid product.", alert=True)
             flow, token = parts[1], parts[2]
-            state = account_product_state.get(uid, {})
-            product_map = state.get("products", state) if isinstance(state, dict) and "products" in state else state
-            product = product_map.get(token) if isinstance(product_map, dict) else None
+            product = resolve_product(token)
             if not product:
-                return await e.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
+                return await e.edit(
+                    f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.",
+                    buttons=[[Button.inline(get_store_buttons(flow)["back"], "shop|%s|1" % flow)]]
+                )
             if get_product_stock(product) == 0:
                 return await e.edit(
                     f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.",
