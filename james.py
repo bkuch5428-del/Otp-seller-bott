@@ -538,8 +538,8 @@ STORE_DEFAULT_MESSAGES = {
 }
 
 STORE_DEFAULT_BUTTONS = {
-    "single": {"product": "{icon} {country}", "buy": "🛒 Buy Now", "back": "⬅️ Back to Products", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"},
-    "bulk": {"product": "{icon} {country}", "quantity": "Quantity", "confirm": "✅ Confirm", "change_quantity": "✏️ Change Quantity", "back": "⬅️ Back to Products", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"}
+    "single": {"product": "{icon} {country}", "buy": "🛒 Buy Now", "back": "⬅️ Back to Accounts", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"},
+    "bulk": {"product": "{icon} {country}", "quantity": "Quantity", "confirm": "✅ Confirm", "change_quantity": "✏️ Change Quantity", "back": "⬅️ Back to Sessions", "previous": "⬅️ Previous", "next": "Next ➡️", "cancel": "❌ Cancel", "page": "Page {page}/{total_pages}"}
 }
 
 def get_store_message(flow):
@@ -559,6 +559,32 @@ def store_banner_key(flow):
 
 def to_usd(inr):
     return round(inr / get_usdt_rate(), 2)
+
+
+def normalize_optional_text(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"", "/skip", "skip"}:
+        return ""
+    return text
+
+
+def parse_inr_price(value):
+    text = normalize_optional_text(value)
+    if not text:
+        return None
+    cleaned = text.replace("₹", "").replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        parsed = float(cleaned)
+    except ValueError:
+        return None
+    if parsed <= 0:
+        return None
+    return int(round(parsed))
+
 
 def is_user_banned(uid):
     res = cur.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
@@ -1108,11 +1134,11 @@ def get_available_account_products():
     columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     dc_expression = "data_center" if "data_center" in columns else "NULL"
     query = f"""
-        SELECT country_icon, country_name, category, account_year, price,
+        SELECT country_icon, country_name, COALESCE(category, ''), account_year, price,
                COUNT(*), MIN(phone), {dc_expression}
         FROM stock
         WHERE available=1
-        GROUP BY country_icon, country_name, category, account_year, price, {dc_expression}
+        GROUP BY country_icon, country_name, COALESCE(category, ''), account_year, price, {dc_expression}
         ORDER BY country_name ASC, account_year DESC, price ASC
     """
     rows = cur.execute(query).fetchall()
@@ -1120,43 +1146,84 @@ def get_available_account_products():
         {
             "icon": row[0] or "🌍",
             "country": row[1] or "Unknown",
-            "category": row[2] or "Standard",
+            "category": row[2] or "",
             "year": row[3],
             "price": int(row[4] or 0),
             "stock": int(row[5] or 0),
             "phone": row[6],
-            "dc": row[7]
+            "dc": None if row[7] in (None, "", "None", "NULL") else row[7]
         }
         for row in rows
     ]
 
+
 def get_product_stock(product):
-    row = cur.execute(
-        "SELECT COUNT(*) FROM stock WHERE available=1 AND country_name=? AND category=? AND account_year=? AND price=?",
-        (product["country"], product["category"], product["year"], product["price"])
-    ).fetchone()
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    category = normalize_optional_text(product.get("category"))
+    dc = product.get("dc")
+    if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
+        dc = None
+
+    query = (
+        "SELECT COUNT(*) FROM stock WHERE available=1 AND country_name=? AND account_year=? AND price=?"
+    )
+    params = [product["country"], product["year"], product["price"]]
+
+    if category:
+        query += " AND COALESCE(category, '')=?"
+        params.insert(1, category)
+    else:
+        query += " AND (COALESCE(category, '')='' OR category IS NULL)"
+
+    if "data_center" in columns:
+        if dc is not None:
+            query += " AND data_center=?"
+            params.append(str(dc))
+        else:
+            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+
+    row = cur.execute(query, params).fetchone()
     return row[0] if row else 0
+
+
+def format_store_product_line(product):
+    display = f"{product['icon']} {product['country']}"
+    category = normalize_optional_text(product.get("category"))
+    if category:
+        display += f" ({category})"
+    dc = normalize_optional_text(product.get("dc"))
+    if dc:
+        display += f" (dc {dc})"
+    if product.get("year"):
+        display += f" {product['year']}"
+    display += f": ${to_usd(product['price']):.2f} (₹{product['price']}) - Stock: {product['stock']}"
+    return f"> • {display}"
+
+
+def get_product_button_label(product):
+    icon = product.get("icon") or "🌍"
+    country = str(product.get("country") or "Unknown").strip()
+    category = normalize_optional_text(product.get("category"))
+    label = f"{icon} {country}"
+    if category:
+        short = f" • {category}"
+        if len(label + short) <= 22:
+            label += short
+    if len(label) > 22:
+        label = label[:21] + "…"
+    return label
+
 
 def account_store_caption(products, page, total_pages, page_products, flow):
     labels = get_store_buttons(flow)
-    product_lines = []
-    for product in page_products:
-        year_line = f" • {html.escape(str(product['year']))}" if product["year"] else ""
-        info_line = (f"🖥 DC {html.escape(str(product['dc']))}" if product["dc"] else "") + year_line
-        product_lines.extend([
-            "",
-            f"{product['icon']} <b>{html.escape(product['country'])}</b> — {html.escape(product['category'])}",
-            info_line,
-            f"💵 ${to_usd(product['price']):.2f} • {P_INR}{product['price']}",
-            f"{P_PKG} Stock: {product['stock']}"
-        ])
+    product_lines = [format_store_product_line(product) for product in page_products]
     page_text = ""
     if total_pages > 1:
         page_text = f"\n\n📄 {html.escape(labels['page'].format(page=page, total_pages=total_pages))}"
     values = {
         "rate": f"{get_usdt_rate():g}",
         "available": sum(product["stock"] for product in products),
-        "products": "\n".join(product_lines) if product_lines else f"\n\n{P_PKG} No accounts are currently available.\n\nPlease check again later.",
+        "products": "\n".join(product_lines) if product_lines else f"\n\n{P_PKG} No accounts/sessions are currently available.\n\nPlease check again later.",
         "page": page_text,
         "total_pages": total_pages
     }
@@ -1173,18 +1240,11 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     page_products = products[(page - 1) * limit:page * limit]
 
     uid = event.sender_id
-    account_product_state[uid] = {str(index): product for index, product in enumerate(page_products)}
+    product_map = {str(index): product for index, product in enumerate(page_products)}
+    account_product_state[uid] = {"page": page, "products": product_map}
     product_buttons = []
     for index, product in enumerate(page_products):
-        try:
-            label = get_store_buttons(flow)["product"].format(
-                icon=product["icon"], country=product["country"], category=product["category"],
-                year=product["year"], price=product["price"], stock=product["stock"]
-            )
-        except (KeyError, ValueError):
-            label = f"{product['icon']} {product['country']}"
-        if len(label) > 32:
-            label = label[:31] + "…"
+        label = get_product_button_label(product)
         product_buttons.append(Button.inline(label, f"prod|{flow}|{index}"))
     buttons = [product_buttons[index:index + 2] for index in range(0, len(product_buttons), 2)]
 
@@ -1212,24 +1272,34 @@ async def render_account_store(event, flow, page=1, send_banner=False):
         await event.respond(caption, buttons=buttons)
 
 async def show_product_details(event, flow, token):
-    product = account_product_state.get(event.sender_id, {}).get(token)
+    state = account_product_state.get(event.sender_id, {})
+    if isinstance(state, dict) and "products" in state:
+        product_map = state.get("products", {})
+        page = state.get("page", 1)
+    else:
+        product_map = state
+        page = 1
+    product = product_map.get(token)
     if not product:
         return await event.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
     stock = get_product_stock(product)
     if stock == 0:
-        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]])
+        await event.edit(f"{P_NO} <b>Out of Stock</b>\n\nThis product is no longer available.", buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|{page}")]])
         return
 
     lines = [
         f"{P_CART} <b>PRODUCT DETAILS</b>",
         "━━━━━━━━━━━━━━━━━━",
         "",
-        f"🌍 <b>Country:</b> {product['icon']} {html.escape(product['country'])}",
-        f"📌 <b>Type:</b> {html.escape(product['category'])}"
+        f"🌍 <b>Country:</b> {product['icon']} {html.escape(product['country'])}"
     ]
-    if product["dc"]:
-        lines.append(f"🖥 <b>DC:</b> {html.escape(str(product['dc']))}")
-    if product["year"]:
+    category = normalize_optional_text(product.get("category"))
+    if category:
+        lines.append(f"📌 <b>Type:</b> {html.escape(category)}")
+    dc = normalize_optional_text(product.get("dc"))
+    if dc:
+        lines.append(f"🖥 <b>DC:</b> {html.escape(str(dc))}")
+    if product.get("year"):
         lines.append(f"📅 <b>Year:</b> {html.escape(str(product['year']))}")
     lines.extend([
         "",
@@ -1239,7 +1309,7 @@ async def show_product_details(event, flow, token):
     ])
     buttons = [
         [Button.inline(get_store_buttons(flow)["buy"], f"pbuy|{flow}|{token}")],
-        [Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]
+        [Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|{page}")]
     ]
     await event.edit("\n".join(lines), buttons=buttons)
 
@@ -1265,7 +1335,7 @@ async def show_years(event, flow, country):
     btns.append([Button.inline("Back to Countries", f"pg_c|{flow}|1")])
     await event.edit(msg, buttons=btns)
 
-async def confirm_purchase(event, country, year, price_str):
+async def confirm_purchase(event, country, year, price_str, category=None, dc=None):
     uid = event.sender_id
     base_price = int(price_str)
     
@@ -1282,22 +1352,39 @@ async def confirm_purchase(event, country, year, price_str):
            f"{P_CARD} <b>Your Balance:</b> {P_INR}{bal}\n\n"
            f"❓ Do you want to proceed with this purchase?")
     
+    category_key = (category or "Standard").strip() or "Standard"
+    dc_key = "" if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
     btns = [
-        [Button.inline(get_store_buttons("single")["buy"], f"buy_cf|{country}|{year}|{base_price}")],
+        [Button.inline(get_store_buttons("single")["buy"], f"buy_cf|{country}|{year}|{base_price}|{category_key}|{dc_key}")],
         [Button.inline(get_store_buttons("single")["cancel"], "cancel_action")]
     ]
     await event.edit(msg, buttons=btns)
 
-async def process_purchase(event, country, year_str, price_str):
+async def process_purchase(event, country, year_str, price_str, category=None, dc=None):
     uid, base_price = event.sender_id, int(price_str)
 
     disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
     discount = disc_row[0] if disc_row else 0
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
-    async with get_user_lock(uid):
-        row = cur.execute("SELECT phone, session_file, country_icon, account_year, twofa FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 LIMIT 1", (f"{country}%", int(year_str), base_price)).fetchone()
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    category = (category or "Standard").strip() or "Standard"
+    dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
+    query = (
+        "SELECT phone, session_file, country_icon, account_year, twofa FROM stock "
+        "WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 AND category=?"
+    )
+    params = [f"{country}%", int(year_str), base_price, category]
+    if "data_center" in columns:
+        if dc is not None:
+            query += " AND data_center=?"
+            params.append(dc)
+        else:
+            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+
+    async with get_user_lock(uid):
+        row = cur.execute(query, params).fetchone()
         if not row:
             return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
         
@@ -1404,13 +1491,26 @@ async def auto_otp_task(phone):
         try: await bot.edit_message(uid, msg_id, f"{P_TIME} <b>Order Expired!</b>\nThe 10-minute limit for <code>{phone}</code> ran out. Your money ({P_INR}{order['price']}) has been automatically refunded.")
         except: pass
 
-async def init_session_purchase(event, country, year, price_str):
+async def init_session_purchase(event, country, year, price_str, category=None, dc=None):
     uid, price = event.sender_id, int(price_str)
-    stock_row = cur.execute("SELECT COUNT(*) FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1", (f"{country}%", int(year), price)).fetchone()
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    category = (category or "Standard").strip() or "Standard"
+    dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
+
+    query = "SELECT COUNT(*) FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
+    params = [f"{country}%", int(year), price, category]
+    if "data_center" in columns:
+        if dc is not None:
+            query += " AND data_center=?"
+            params.append(dc)
+        else:
+            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+
+    stock_row = cur.execute(query, params).fetchone()
     stock = stock_row[0] if stock_row else 0
     if stock == 0: return await event.answer("❌ Out of stock!", alert=True)
     
-    session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock}
+    session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock, 'category': category, 'dc': dc}
     disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
     discount = disc_row[0] if disc_row else 0
     p_disp = price if discount == 0 else int(price * (100 - discount) / 100)
@@ -1423,10 +1523,26 @@ async def init_session_purchase(event, country, year, price_str):
 
 async def process_bulk_sessions(event, uid, qty, state, final_cost):
     country, year, price = state['country'], int(state['year']), int(state['price'])
+    category = (state.get('category') or 'Standard').strip() or 'Standard'
+    dc = state.get('dc')
+    if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
+        dc = None
     await event.respond(f"{PE_LIGHTNING} <b>Processing your sessions...</b>")
 
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+    query = "SELECT phone, session_file, twofa, account_year FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
+    params = [f"{country}%", year, price, category]
+    if "data_center" in columns:
+        if dc is not None:
+            query += " AND data_center=?"
+            params.append(str(dc))
+        else:
+            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
+    query += " LIMIT ?"
+    params.append(qty)
+
     async with get_user_lock(uid):
-        rows = cur.execute("SELECT phone, session_file, twofa, account_year FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 LIMIT ?", (f"{country}%", year, price, qty)).fetchall()
+        rows = cur.execute(query, params).fetchall()
         if len(rows) < qty:
             return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
         
@@ -2520,42 +2636,85 @@ async def admin_actions(event):
                 client = TelegramClient(sp, API_ID, API_HASH)
                 await client.connect()
                 sreq = await client.send_code_request(phone)
-                
+
                 twofa_pass = "None"
-                try: 
+                try:
                     await client.sign_in(phone, (await get_reply(f"{P_OTP} OTP:")).text, phone_code_hash=sreq.phone_code_hash)
-                except SessionPasswordNeededError: 
+                except SessionPasswordNeededError:
                     twofa_pass = html.escape((await get_reply(f"{P_2FA} 2FA Pass required. Enter it now:")).text)
                     await client.sign_in(password=twofa_pass)
-                
-                c_name, c_icon = get_country_info(phone)
-                
-                if c_name == "Unknown":
-                    await conv.send_message(f"{P_WARN} <b>Country not recognized for +{phone}!</b>")
-                    c_icon = html.escape((await get_reply(f"{P_FLAG} <b>Enter Country Flag Emoji:</b>\n<i>Example: 🇮🇳</i>")).text)
-                    c_name = html.escape((await get_reply(f"{P_GLOBE} <b>Enter Country Name:</b>\n<i>Example: India</i>")).text)
-                
-                auto_year = await detect_account_year(client)
-                await client.disconnect()
-                
-                year = int((await get_reply(f"{P_CAL} Detected Year: <b>{auto_year}</b>\nReply with Year to confirm or change:")).text)
-                auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year=?", (c_name, str(year))).fetchone()
-                if not auto_row: auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year='Common'", (c_name,)).fetchone()
 
-                if auto_row:
-                    price = auto_row[0]
-                    await conv.send_message(f"⚡ <b>Auto-Price Applied:</b> {P_INR}{price} for {c_name} ({year})")
-                else:
-                    existing_price = cur.execute("SELECT price FROM stock WHERE country_name=? LIMIT 1", (c_name,)).fetchone()
-                    if existing_price:
-                        price = existing_price[0]
-                        await conv.send_message(f"⚡ <b>Auto-detected Price:</b> {P_INR}{price} for {c_name}")
-                    else: price = int((await get_reply(f"{P_MONEY} Price (₹):")).text)
-                
-                cur.execute("INSERT OR REPLACE INTO stock (phone, session_file, country_name, country_icon, account_year, category, price, available, twofa) VALUES (?,?,?,?,?,?,?,?,?)", 
-                            (phone, sp + ".session", c_name, c_icon, year, 'Good', price, 1, twofa_pass))
+                c_name = ""
+                while True:
+                    c_name = normalize_optional_text((await get_reply(f"{P_GLOBE} <b>Country:</b>\nEnter country name.")).text)
+                    if c_name:
+                        break
+                    await conv.send_message(f"{P_WARN} Country is required. Please enter a country name or /cancel to abort.")
+
+                category = ""
+                category_value = normalize_optional_text((await get_reply(f"{P_DOC} <b>Condition / Type:</b>\nExample: Spam Free, Spammed Account, etc.\nOr type <code>/skip</code>")).text)
+                if category_value:
+                    category = category_value
+
+                dc = None
+                dc_value = normalize_optional_text((await get_reply(f"{P_PC} <b>Data Center:</b>\nEnter DC or type <code>/skip</code>.")).text)
+                if dc_value:
+                    dc = dc_value
+
+                year = None
+                while True:
+                    year_raw = normalize_optional_text((await get_reply(f"{P_CAL} <b>Year:</b>\nEnter year or type <code>/skip</code>.")).text)
+                    if not year_raw:
+                        break
+                    try:
+                        year = int(year_raw)
+                        if year <= 0:
+                            raise ValueError
+                        break
+                    except ValueError:
+                        await conv.send_message(f"{P_WARN} Invalid year. Please enter a valid year or type <code>/skip</code>.")
+
+                price = None
+                while True:
+                    price_raw = (await get_reply(f"{P_MONEY} <b>Price (₹):</b>\nEnter selling price in INR.")).text
+                    price = parse_inr_price(price_raw)
+                    if price is not None:
+                        break
+                    await conv.send_message(f"❌ Price is required.\n\nPlease enter the price in INR.\nOr provide /cancel to abort.")
+
+                c_icon = get_flag_by_country_name(c_name) or "🌍"
+                if c_icon == "🌍" and (country_name := c_name.lower()):
+                    try:
+                        c_icon = next((v[1] for k, v in COUNTRY_CODES.items() if k and str(v[0]).lower() == country_name), "🌍")
+                    except Exception:
+                        pass
+
+                auto_year = await detect_account_year(client)
+                if year is None:
+                    year = auto_year
+                await client.disconnect()
+
+                stock_columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+                insert_columns = ["phone", "session_file", "country_name", "country_icon", "account_year", "category", "price", "available", "twofa"]
+                insert_values = [phone, sp + ".session", c_name, c_icon, year, category, price, 1, twofa_pass]
+                if "data_center" in stock_columns:
+                    insert_columns.append("data_center")
+                    insert_values.append(dc)
+                cur.execute(
+                    f"INSERT OR REPLACE INTO stock ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
+                    insert_values
+                )
                 db.commit()
-                await conv.send_message(f"{P_YES} Added!")
+                usd_price = to_usd(price)
+                display = f"{c_icon} {c_name}"
+                if category:
+                    display += f" ({category.lower()})"
+                if dc:
+                    display += f" (dc {str(dc).lower()})"
+                if year:
+                    display += f" {year}"
+                display += f": ${usd_price:.2f} (₹{price})"
+                await conv.send_message(f"{P_YES} <b>Added successfully!</b>\n\n{display}")
 
             elif action_data == "supporturl" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 url = (await get_reply("🔗 Enter new Support URL (must start with http:// or https://):")).text
@@ -2966,7 +3125,9 @@ async def handle_callback_query(e):
             if len(parts) != 3 or parts[1] not in {"single", "bulk"} or not parts[2].isdigit():
                 return await e.answer("Invalid product.", alert=True)
             flow, token = parts[1], parts[2]
-            product = account_product_state.get(uid, {}).get(token)
+            state = account_product_state.get(uid, {})
+            product_map = state.get("products", state) if isinstance(state, dict) and "products" in state else state
+            product = product_map.get(token) if isinstance(product_map, dict) else None
             if not product:
                 return await e.answer("⚠️ Product list expired. Please reopen the shop.", alert=True)
             if get_product_stock(product) == 0:
@@ -2975,9 +3136,9 @@ async def handle_callback_query(e):
                     buttons=[[Button.inline(get_store_buttons(flow)["back"], f"shop|{flow}|1")]]
                 )
             if flow == "single":
-                await confirm_purchase(e, product["country"], product["year"], str(product["price"]))
+                await confirm_purchase(e, product["country"], product["year"], str(product["price"]), product.get("category"), product.get("dc"))
             else:
-                await init_session_purchase(e, product["country"], product["year"], str(product["price"]))
+                await init_session_purchase(e, product["country"], product["year"], str(product["price"]), product.get("category"), product.get("dc"))
 
         elif data.startswith("pg_c|"): 
             p = data.split("|")
@@ -2994,7 +3155,9 @@ async def handle_callback_query(e):
             
         elif data.startswith("buy_cf|"):
             p = data.split("|")
-            await process_purchase(e, p[1], p[2], p[3])
+            category = p[4] if len(p) > 4 else None
+            dc = p[5] if len(p) > 5 else None
+            await process_purchase(e, p[1], p[2], p[3], category, dc)
 
         elif data.startswith("get_otp_again|"):
             phone = data.split("|")[1]
