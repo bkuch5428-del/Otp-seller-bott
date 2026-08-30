@@ -1119,7 +1119,7 @@ async def show_upi_qr(event, amount):
         
         # Send generated QR
         try:
-            await bot.send_file(uid, generated_qr, caption=msg, force_document=False, buttons=[
+            await bot.send_file(uid, generated_qr, caption=msg, force_document=False, mime_type="image/png", buttons=[
                 [Button.inline("📸 Upload Payment Screenshot", "upload_payment_screenshot")],
                 [Button.inline("❌ Cancel", "cancel_action")]
             ])
@@ -3359,6 +3359,13 @@ async def handle_callback_query(e):
         elif data.startswith("depm_"): await manual_deposit_init(e, data.replace("depm_", ""))
         elif data == "dep_upi": await init_upi_keypad(e)
         elif data == "upload_payment_screenshot":
+            if uid not in waiting_proof and uid in pending_utr:
+                pending = pending_utr[uid]
+                waiting_proof[uid] = {
+                    'amount': pending['amount'],
+                    'method': 'UPI',
+                    'order_id': pending['order_id']
+                }
             if uid not in waiting_proof:
                 return await e.answer("📸 Please upload your payment screenshot after making the transfer.", alert=True)
             try:
