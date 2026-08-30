@@ -965,7 +965,7 @@ async def deposit_menu(event):
            f"{PE_GIFT} Cwallet gives <b>+5% bonus</b>!")
     
     flat_buttons = [
-        Button.inline("⚡ UPI Automatic", "dep_upi"),
+        Button.inline("🏦 Manual Payment", "dep_upi"),
         Button.inline(f"👛 Cwallet (+5%)", "depm_Cwallet")
     ]
     
@@ -1102,14 +1102,11 @@ async def show_upi_qr(event, amount):
                     (order_id, uid, amount, "pending"))
         db.commit()
         
-        msg = (f"{PE_LIGHTNING} <b>AUTOMATIC UPI PAYMENT</b>\n\n"
+        msg = (f"{PE_LIGHTNING} <b>UPI PAYMENT</b>\n\n"
                f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
                f"{P_ID} Order ID: <code>{order_id}</code>\n\n"
-               f"👇 <b>Scan QR below or Pay to:</b>\n<code>{UPI_ID}</code>\n\n"
-               f"📌 <b>After Payment:</b>\n"
-               f"1️⃣ Send your <b>12-Digit UTR</b> number\n"
-               f"2️⃣ Send <b>Screenshot</b> of payment confirmation\n\n"
-               f"⚠️ <b>Both UTR and Screenshot are required!</b>")
+               f"👇 <b>Scan QR below or pay to:</b>\n<code>{UPI_ID}</code>\n\n"
+               f"📸 <b>Please send a payment screenshot after making the transfer.</b>")
         
         await event.delete()
         
@@ -1122,38 +1119,30 @@ async def show_upi_qr(event, amount):
         
         # Send generated QR
         try:
-            await bot.send_file(uid, generated_qr, caption=msg, buttons=[
-                [Button.inline("📝 Submit UTR", f"submit_utr_{order_id}")],
+            await bot.send_file(uid, generated_qr, caption=msg, force_document=False, buttons=[
                 [Button.inline("❌ Cancel", "cancel_action")]
             ])
         except Exception as e:
             logger.error(f"QR Send Error: {e}")
             # Fallback: Send UPI ID only
-            fallback_msg = (f"{PE_LIGHTNING} <b>AUTOMATIC UPI PAYMENT</b>\n\n"
+            fallback_msg = (f"{PE_LIGHTNING} <b>UPI PAYMENT</b>\n\n"
                            f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
                            f"{P_ID} Order ID: <code>{order_id}</code>\n\n"
                            f"👇 <b>Pay to this UPI ID:</b>\n<code>{UPI_ID}</code>\n\n"
-                           f"📌 <b>After Payment:</b>\n"
-                           f"1️⃣ Send your <b>12-Digit UTR</b> number\n"
-                           f"2️⃣ Send <b>Screenshot</b> of payment confirmation\n\n"
-                           f"⚠️ <b>Both UTR and Screenshot are required!</b>")
+                           f"📸 <b>Please send a payment screenshot after making the transfer.</b>")
             
             await bot.send_message(uid, fallback_msg, buttons=[
-                [Button.inline("📝 Submit UTR", f"submit_utr_{order_id}")],
                 [Button.inline("❌ Cancel", "cancel_action")]
             ])
             
     except Exception as e:
         logger.error(f"show_upi_qr Error: {e}")
         # Ultimate fallback
-        fallback_msg = (f"{PE_LIGHTNING} <b>AUTOMATIC UPI PAYMENT</b>\n\n"
+        fallback_msg = (f"{PE_LIGHTNING} <b>UPI PAYMENT</b>\n\n"
                        f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
                        f"{P_ID} Order ID: <code>{order_id}</code>\n\n"
                        f"👇 <b>Pay to this UPI ID:</b>\n<code>{UPI_ID}</code>\n\n"
-                       f"📌 <b>After Payment:</b>\n"
-                       f"1️⃣ Send your <b>12-Digit UTR</b> number\n"
-                       f"2️⃣ Send <b>Screenshot</b> of payment confirmation\n\n"
-                       f"⚠️ <b>Both UTR and Screenshot are required!</b>")
+                       f"📸 <b>Please send a payment screenshot after making the transfer.</b>")
         
         pending_utr[uid] = {
             'order_id': order_id,
@@ -1162,7 +1151,6 @@ async def show_upi_qr(event, amount):
         }
         
         await bot.send_message(uid, fallback_msg, buttons=[
-            [Button.inline("📝 Submit UTR", f"submit_utr_{order_id}")],
             [Button.inline("❌ Cancel", "cancel_action")]
         ])
 
@@ -3368,7 +3356,6 @@ async def handle_callback_query(e):
         elif data.startswith("depm_"): await manual_deposit_init(e, data.replace("depm_", ""))
         elif data == "dep_upi": await init_upi_keypad(e)
         elif data.startswith("kp_"): await keypad_logic(e)
-        elif data.startswith("submit_utr_"): await submit_utr_handler(e, data.replace("submit_utr_", ""))
         
         elif data.startswith("adm_") and is_admin(uid): await admin_actions(e)
         
