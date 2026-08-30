@@ -15,6 +15,11 @@ import hashlib
 from datetime import datetime
 from urllib.parse import quote
 
+try:
+    from pymongo import MongoClient
+except Exception:  # pragma: no cover
+    MongoClient = None
+
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError, 
@@ -221,6 +226,126 @@ def validate_config():
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DB = os.getenv("MONGODB_DB", "otp_seller_bot")
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "inventory")
+
+
+def mongo_inventory_collection():
+    if not MONGODB_URI or MongoClient is None:
+        return None
+    try:
+        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000)
+        client.admin.command("ping")
+        return client[MONGODB_DB][MONGODB_COLLECTION]
+    except Exception as exc:
+        logger.warning("MongoDB unavailable; falling back to SQLite stock state: %s", exc)
+        return None
+
+
+def stock_row_to_doc(row):
+    if not isinstance(row, tuple):
+        row = tuple(row)
+    data = {
+        "phone": row[0],
+        "session_file": row[1],
+        "country_name": row[2],
+        "country_icon": row[3] if len(row) > 3 and row[3] else "🌍",
+        "account_year": row[4] if len(row) > 4 else None,
+        "category": row[5] if len(row) > 5 else "Good",
+        "price": int(row[6]) if len(row) > 6 and row[6] is not None else 0,
+        "available": int(row[7]) if len(row) > 7 and row[7] is not None else 1,
+        "twofa": row[8] if len(row) > 8 and row[8] else "None",
+        "added_date": row[9] if len(row) > 9 else None,
+    }
+    if len(row) > 10 and row[10] is not None:
+        data["data_center"] = row[10]
+    return data
+
+
+def upsert_stock_doc_to_mongo(doc):
+    collection = mongo_inventory_collection()
+    if not collection or not doc or not doc.get("phone"):
+        return False
+    try:
+        collection.update_one({"phone": doc["phone"]}, {"$set": doc}, upsert=True)
+        return True
+    except Exception as exc:
+        logger.warning("Mongo inventory upsert failed for %s: %s", doc.get("phone"), exc)
+        return False
+
+
+def set_stock_available_in_mongo(phone, available):
+    collection = mongo_inventory_collection()
+    if not collection or not phone:
+        return False
+    try:
+        collection.update_one({"phone": phone}, {"$set": {"available": 1 if available else 0}}, upsert=False)
+        return True
+    except Exception as exc:
+        logger.warning("Mongo inventory availability update failed for %s: %s", phone, exc)
+        return False
+
+
+def migrate_sqlite_stock_to_mongo():
+    if "cur" not in globals() or cur is None:
+        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "db_not_ready"}
+
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "skipped_no_mongo"}
+
+    try:
+        cols = [row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()]
+        query = "SELECT phone, session_file, country_name, country_icon, account_year, category, price, available, twofa, added_date"
+        if "data_center" in cols:
+            query += ", data_center"
+        query += " FROM stock"
+        rows = cur.execute(query).fetchall()
+    except Exception as exc:
+        logger.warning("Mongo migration failed to read SQLite stock: %s", exc)
+        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "read_failed"}
+
+    stats = {"total_old_records": len(rows), "migrated": 0, "skipped_duplicates": 0, "failed": 0}
+    for row in rows:
+        doc = stock_row_to_doc(row)
+        if not doc.get("phone"):
+            stats["failed"] += 1
+            continue
+        try:
+            if collection.count_documents({"phone": doc["phone"]}, limit=1) > 0:
+                stats["skipped_duplicates"] += 1
+                continue
+            collection.insert_one(doc)
+            stats["migrated"] += 1
+        except Exception as exc:
+            logger.warning("Failed to migrate stock item %s to Mongo: %s", doc.get("phone"), exc)
+            stats["failed"] += 1
+    return {"status": "ok", **stats}
+
+
+def inventory_count_from_mongo(filters=None):
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return 0
+    try:
+        return collection.count_documents(filters or {})
+    except Exception as exc:
+        logger.warning("Mongo count_documents failed: %s", exc)
+        return 0
+
+
+def get_mongo_available_inventory():
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return []
+    try:
+        return list(collection.find({"available": 1}, {"_id": 0}))
+    except Exception as exc:
+        logger.warning("Mongo inventory read failed: %s", exc)
+        return []
+
+
 validate_config()
 
 os.makedirs("sessions", exist_ok=True)
@@ -362,6 +487,17 @@ def update_database_schema():
 
 setup_db()
 update_database_schema()
+
+# Run the Mongo migration once the SQLite inventory is ready.
+try:
+    if MONGODB_URI:
+        mongo_stats = migrate_sqlite_stock_to_mongo()
+        if mongo_stats.get("status") == "ok":
+            logger.info("MongoDB inventory migration complete: %s", mongo_stats)
+        elif mongo_stats.get("status") not in {"skipped_no_mongo", "db_not_ready"}:
+            logger.warning("MongoDB migration did not complete: %s", mongo_stats)
+except Exception as exc:
+    logger.warning("MongoDB migration error: %s", exc)
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
