@@ -18,6 +18,7 @@ class FakeCollection:
     def __init__(self):
         self.documents = []
         self.indexes = [{"name": "_id_", "key": {"_id": 1}, "unique": True}]
+        self.create_index_calls = []
 
     @staticmethod
     def matches(document, query):
@@ -106,6 +107,9 @@ class FakeCollection:
         return len(self.find(query))
 
     def create_index(self, keys, name, unique=False):
+        self.create_index_calls.append(
+            {"keys": list(keys), "name": name, "unique": unique}
+        )
         self.indexes.append(
             {"name": name, "key": dict(keys), "unique": unique}
         )
@@ -244,6 +248,24 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertIn(
             "auto_prices_country_year_unique",
             report["indexes"]["auto_prices"]["created"],
+        )
+
+    def test_prepare_does_not_create_builtin_id_index(self):
+        database = FakeDatabase()
+        users = database["users"]
+        users.indexes = []
+
+        repository = MongoRepository(database)
+        report = repository.prepare()
+
+        self.assertIn("_id_", report["indexes"]["users"]["verified"])
+        self.assertNotIn(
+            "_id_",
+            [call["name"] for call in users.create_index_calls],
+        )
+        self.assertIn(
+            "users_referred_by",
+            [call["name"] for call in users.create_index_calls],
         )
 
     def test_duplicate_unique_keys_are_reported_and_index_is_not_created(self):

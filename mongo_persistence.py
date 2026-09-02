@@ -471,6 +471,10 @@ class MongoRepository:
             return True
         return False
 
+    @staticmethod
+    def _is_builtin_id_index(definition: IndexDefinition) -> bool:
+        return definition.keys == (("_id", 1),)
+
     def prepare(self) -> dict[str, Any]:
         """Create missing collections and safe indexes, never deleting data."""
         try:
@@ -499,6 +503,11 @@ class MongoRepository:
             skipped_duplicates = []
             errors = []
             for definition in definitions:
+                if self._is_builtin_id_index(definition):
+                    # MongoDB creates this unique index for every collection.
+                    # It must not be sent to create_index with unique=True.
+                    verified.append(definition.name)
+                    continue
                 if self._index_is_present(indexes, definition):
                     verified.append(definition.name)
                     continue
