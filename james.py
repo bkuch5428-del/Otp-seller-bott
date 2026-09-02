@@ -306,18 +306,22 @@ def migrate_sqlite_stock_to_mongo():
         logger.warning("Mongo migration failed to read SQLite stock: %s", exc)
         return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "read_failed"}
 
-    stats = {"total_old_records": len(rows), "migrated": 0, "skipped_duplicates": 0, "failed": 0}
+    stats = {"total_old_records": len(rows), "migrated": 0, "updated": 0, "skipped_duplicates": 0, "failed": 0}
     for row in rows:
         doc = stock_row_to_doc(row)
         if not doc.get("phone"):
             stats["failed"] += 1
             continue
         try:
-            if collection.count_documents({"phone": doc["phone"]}, limit=1) > 0:
-                stats["skipped_duplicates"] += 1
-                continue
-            collection.insert_one(doc)
-            stats["migrated"] += 1
+            result = collection.update_one(
+                {"phone": doc["phone"]},
+                {"$set": doc},
+                upsert=True,
+            )
+            if result.upserted_id is None:
+                stats["updated"] += 1
+            else:
+                stats["migrated"] += 1
         except Exception as exc:
             logger.warning("Failed to migrate stock item %s to Mongo: %s", doc.get("phone"), exc)
             stats["failed"] += 1
@@ -344,6 +348,48 @@ def get_mongo_available_inventory():
     except Exception as exc:
         logger.warning("Mongo inventory read failed: %s", exc)
         return []
+
+
+def sync_stock_phones_to_mongo(phones):
+    """Mirror the current SQLite stock rows for the supplied phone numbers."""
+    unique_phones = tuple(dict.fromkeys(str(phone) for phone in phones if phone))
+    if not unique_phones:
+        return 0
+
+    collection = mongo_inventory_collection()
+    if collection is None:
+        return 0
+
+    try:
+        columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
+        fields = [
+            "phone", "session_file", "country_name", "country_icon",
+            "account_year", "category", "price", "available", "twofa", "added_date"
+        ]
+        if "data_center" in columns:
+            fields.append("data_center")
+        query = f"SELECT {', '.join(fields)} FROM stock WHERE phone=?"
+    except Exception as exc:
+        logger.warning("Mongo inventory sync failed to inspect SQLite stock: %s", exc)
+        return 0
+
+    synced = 0
+    for phone in unique_phones:
+        try:
+            row = cur.execute(query, (phone,)).fetchone()
+            if row:
+                collection.update_one(
+                    {"phone": phone},
+                    {"$set": stock_row_to_doc(row)},
+                    upsert=True,
+                )
+            else:
+                # This exact stock row was intentionally removed from SQLite.
+                collection.delete_one({"phone": phone})
+            synced += 1
+        except Exception as exc:
+            logger.warning("Mongo inventory sync failed for %s: %s", phone, exc)
+    return synced
 
 
 validate_config()
@@ -1545,6 +1591,7 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
         cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
         db.commit()
 
+    sync_stock_phones_to_mongo([phone])
     await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
     clean_sess = sess if not sess.endswith(".session") else sess[:-8]
     client = TelegramClient(clean_sess, API_ID, API_HASH)
@@ -1557,6 +1604,7 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
             db.commit()
+        sync_stock_phones_to_mongo([phone])
         await client.disconnect()
         delete_session_files(sess)
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
@@ -1607,6 +1655,7 @@ async def auto_otp_task(phone):
                         cur.execute("INSERT INTO orders (user_id, country, year, price, phone, otp) VALUES (?,?,?,?,?,?)", (uid, order['country'], order['year'], order['price'], phone, code))
                         cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
                         db.commit()
+                    sync_stock_phones_to_mongo([phone])
                     
                     await log_primary_purchase(uid, order['country'], order['price'], order['price'], order['year'], 1)
                 
@@ -1635,6 +1684,7 @@ async def auto_otp_task(phone):
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (order['price'], uid))
             cur.execute("UPDATE stock SET available=1 WHERE phone=?", (phone,))
             db.commit()
+        sync_stock_phones_to_mongo([phone])
             
         try: await bot.edit_message(uid, msg_id, f"{P_TIME} <b>Order Expired!</b>\nThe 10-minute limit for <code>{phone}</code> ran out. Your money ({P_INR}{order['price']}) has been automatically refunded.")
         except: pass
@@ -1706,6 +1756,7 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
         for p in phones:
             cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
         db.commit()
+    sync_stock_phones_to_mongo(phones)
 
     zip_name = f"sessions_{uid}_{int(time.time())}.zip"
     numbers_txt = ""
@@ -2638,28 +2689,44 @@ async def admin_actions(event):
                 
                 if action == "name":
                     new_name = html.escape((await get_reply(f"{P_DOC} <b>Enter NEW Name for {c_name}:</b>")).text)
+                    affected_phones = [row[0] for row in cur.execute(
+                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
+                    ).fetchall()]
                     cur.execute("UPDATE stock SET country_name=? WHERE country_name=?", (new_name, c_name))
                     cur.execute("UPDATE auto_prices SET country=? WHERE country=?", (new_name, c_name))
                     db.commit()
+                    sync_stock_phones_to_mongo(affected_phones)
                     await conv.send_message(f"{P_YES} Country '{c_name}' successfully renamed to '{new_name}'!")
                     
                 elif action == "flag":
                     new_flag = html.escape((await get_reply(f"{P_FLAG} <b>Enter NEW Flag Emoji for {c_name}:</b>")).text)
+                    affected_phones = [row[0] for row in cur.execute(
+                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
+                    ).fetchall()]
                     cur.execute("UPDATE stock SET country_icon=? WHERE country_name=?", (new_flag, c_name))
                     db.commit()
+                    sync_stock_phones_to_mongo(affected_phones)
                     await conv.send_message(f"{P_YES} Flag updated to {new_flag} for '{c_name}'!")
                     
                 elif action == "cprice":
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Common Price for all {c_name} accounts:</b>")).text)
+                    affected_phones = [row[0] for row in cur.execute(
+                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
+                    ).fetchall()]
                     cur.execute("UPDATE stock SET price=? WHERE country_name=?", (new_p, c_name))
                     db.commit()
+                    sync_stock_phones_to_mongo(affected_phones)
                     await conv.send_message(f"{P_YES} All existing '{c_name}' accounts updated to {P_INR}{new_p}!")
                     
                 elif action == "yprice":
                     year = parts[3]
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Price for {c_name} ({year}):</b>")).text)
+                    affected_phones = [row[0] for row in cur.execute(
+                        "SELECT phone FROM stock WHERE country_name=? AND account_year=?", (c_name, year)
+                    ).fetchall()]
                     cur.execute("UPDATE stock SET price=? WHERE country_name=? AND account_year=?", (new_p, c_name, year))
                     db.commit()
+                    sync_stock_phones_to_mongo(affected_phones)
                     await conv.send_message(f"{P_YES} All existing '{c_name}' ({year}) accounts updated to {P_INR}{new_p}!")
                     
             elif action_data.startswith("apset|") and (uid in ADMIN_IDS or has_perm(uid, 'p_manage_stock')):
@@ -2748,6 +2815,7 @@ async def admin_actions(event):
                         for acc in groups[new_key]: acc["c_icon"] = new_icon
 
                 success = 0
+                added_phones = []
                 for (c_name, year, has_2fa), accs in groups.items():
                     c_icon = accs[0]["c_icon"]
                     twofa_pass = "None"
@@ -2773,8 +2841,10 @@ async def admin_actions(event):
                             if os.path.exists(acc['path'] + ext): shutil.move(acc['path'] + ext, perm_base + ext)
                         cur.execute("INSERT OR REPLACE INTO stock (phone, session_file, country_name, country_icon, account_year, category, price, available, twofa) VALUES (?,?,?,?,?,?,?,?,?)", 
                                     (acc['phone'], perm_base + ".session", c_name, c_icon, year, 'Good', price, 1, twofa_pass))
+                        added_phones.append(acc['phone'])
                         success += 1
                 db.commit()
+                sync_stock_phones_to_mongo(added_phones)
                 os.remove(zip_path); shutil.rmtree(extracted_dir)
                 await conv.send_message(f"{P_YES} <b>Bulk Interactive Upload Complete!</b>\n{P_ON} Added: {success}")
 
@@ -2853,6 +2923,7 @@ async def admin_actions(event):
                     insert_values
                 )
                 db.commit()
+                sync_stock_phones_to_mongo([phone])
                 usd_price = to_usd(price)
                 display = f"{c_icon} {c_name}"
                 if category:
