@@ -12,13 +12,9 @@ import shutil
 import html
 import json
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
-
-try:
-    from pymongo import MongoClient
-except Exception:  # pragma: no cover
-    MongoClient = None
+from mongo_persistence import MongoRepository, MongoRuntimeStore, create_mongo_client
 
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
@@ -230,17 +226,46 @@ MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
 MONGODB_DB = os.getenv("MONGODB_DB", "otp_seller_bot")
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "inventory")
 
+mongo_client = None
+mongo_repository = None
+mongo_store = None
+
+
+def initialize_mongo_runtime():
+    """Connect to MongoDB before starting the bot; never fall back silently."""
+    global mongo_client, mongo_repository, mongo_store
+    try:
+        if not MONGODB_URI:
+            raise RuntimeError("MONGODB_URI is required for MongoDB runtime")
+        mongo_client = create_mongo_client(MONGODB_URI)
+        mongo_client.admin.command("ping")
+        mongo_repository = MongoRepository(
+            mongo_client[MONGODB_DB],
+            inventory_collection_name=MONGODB_COLLECTION,
+        )
+        prepare_report = mongo_repository.prepare()
+        prepare_errors = []
+        for collection_name, details in prepare_report["collections"].items():
+            if details.get("error"):
+                prepare_errors.append(f"{collection_name}: {details['error']}")
+        for collection_name, details in prepare_report["indexes"].items():
+            for error in details.get("errors", []):
+                prepare_errors.append(f"{collection_name}: {error}")
+        if prepare_errors:
+            raise RuntimeError(
+                "MongoDB collection/index preparation failed: "
+                + "; ".join(prepare_errors)
+            )
+        mongo_store = MongoRuntimeStore(mongo_repository)
+        logger.info("MongoDB runtime initialized for database %s", MONGODB_DB)
+    except Exception as exc:
+        raise RuntimeError(f"MongoDB runtime initialization failed: {exc}") from exc
+
 
 def mongo_inventory_collection():
-    if not MONGODB_URI or MongoClient is None:
-        return None
-    try:
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=3000)
-        client.admin.command("ping")
-        return client[MONGODB_DB][MONGODB_COLLECTION]
-    except Exception as exc:
-        logger.warning("MongoDB unavailable; falling back to SQLite stock state: %s", exc)
-        return None
+    if mongo_repository is None:
+        raise RuntimeError("MongoDB runtime has not been initialized")
+    return mongo_repository.collection("inventory")
 
 
 def stock_row_to_doc(row):
@@ -393,6 +418,7 @@ def sync_stock_phones_to_mongo(phones):
 
 
 validate_config()
+initialize_mongo_runtime()
 
 os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
@@ -534,21 +560,10 @@ def update_database_schema():
 setup_db()
 update_database_schema()
 
-# Run the Mongo migration once the SQLite inventory is ready.
-try:
-    if MONGODB_URI:
-        mongo_stats = migrate_sqlite_stock_to_mongo()
-        if mongo_stats.get("status") == "ok":
-            logger.info("MongoDB inventory migration complete: %s", mongo_stats)
-        elif mongo_stats.get("status") not in {"skipped_no_mongo", "db_not_ready"}:
-            logger.warning("MongoDB migration did not complete: %s", mongo_stats)
-except Exception as exc:
-    logger.warning("MongoDB migration error: %s", exc)
-
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
-    res = cur.execute("SELECT value FROM settings WHERE key='bot_status'").fetchone()
-    return res[0] == 'on' if res else True
+    value = get_setting("bot_status")
+    return value == 'on' if value is not None else True
 
 def is_maintenance_mode():
     return get_setting("maintenance_enabled", "off") == "on"
@@ -562,22 +577,23 @@ def get_maintenance_message():
 def is_admin(uid):
     if uid in ADMIN_IDS:
         return True
-    row = cur.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,)).fetchone()
-    return bool(row)
+    return mongo_store.is_admin(uid)
 
 def has_perm(uid, perm):
     if uid in ADMIN_IDS:
         return True
-    row = cur.execute(f"SELECT {perm} FROM admins WHERE user_id=?", (uid,)).fetchone()
-    return bool(row and row[0] == 1)
+    return mongo_store.has_permission(uid, perm)
 
 def ensure_user(uid):
+    mongo_store.ensure_user(uid)
+    # Balance/order/deposit migration is intentionally deferred. Keep the
+    # legacy row available for those untouched paths without replacing it.
     cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (uid,))
     db.commit()
 
 def get_usdt_rate():
-    res = cur.execute("SELECT value FROM settings WHERE key='usdt_rate'").fetchone()
-    try: return float(res[0]) if res else float(DEFAULT_USDT_RATE)
+    value = get_setting("usdt_rate")
+    try: return float(value) if value is not None else float(DEFAULT_USDT_RATE)
     except: return float(DEFAULT_USDT_RATE)
 
 def get_auto_cancel_seconds():
@@ -591,21 +607,18 @@ def get_terms_url():
     return fix_url(get_setting("terms_url", TERMS_URL))
 
 def get_support_url():
-    res = cur.execute("SELECT value FROM settings WHERE key='support_url'").fetchone()
-    url = res[0] if res and res[0] else DEFAULT_SUPPORT_URL
+    value = get_setting("support_url")
+    url = value if value else DEFAULT_SUPPORT_URL
     return fix_url(url)
 
 def get_setting(key, default=None):
-    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row[0] if row else default
+    return mongo_store.get_setting(key, default)
 
 def set_setting(key, value):
-    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    db.commit()
+    mongo_store.set_setting(key, value)
 
 def delete_setting(key):
-    cur.execute("DELETE FROM settings WHERE key=?", (key,))
-    db.commit()
+    mongo_store.delete_setting(key)
 
 async def send_broadcast_content(recipient_id, draft):
     message = draft["message"]
@@ -625,7 +638,7 @@ async def send_broadcast_preview(admin_id, draft):
     return await bot.send_message(admin_id, draft["text"], buttons=buttons, parse_mode="html")
 
 async def run_broadcast(admin_id, chat_id, draft):
-    users = cur.execute("SELECT user_id FROM users").fetchall()
+    users = [(user_id,) for user_id in mongo_store.list_user_ids()]
     total = len(users)
     sent = failed = blocked = 0
     progress_message = await bot.send_message(
@@ -777,8 +790,20 @@ def parse_inr_price(value):
 
 
 def is_user_banned(uid):
-    res = cur.execute("SELECT banned FROM users WHERE user_id=?", (uid,)).fetchone()
-    return res and res[0] == 1
+    user = mongo_store.get_user(uid, {"banned": 1})
+    return bool(user and user.get("banned") == 1)
+
+def get_user_discount(uid):
+    user = mongo_store.get_user(uid, {"discount": 1})
+    return int(user.get("discount", 0) or 0) if user else 0
+
+def get_user_terms_accepted(uid):
+    user = mongo_store.get_user(uid, {"terms_accepted": 1})
+    return int(user.get("terms_accepted", 0) or 0) if user else 0
+
+def get_user_balance(uid):
+    row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+    return row[0] if row else 0
 
 def update_balance(uid, amount):
     cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, uid))
@@ -833,8 +858,8 @@ def get_flag_by_country_name(name):
     for code, (c_name, c_flag) in COUNTRY_CODES.items():
         if c_name == name: return c_flag
     try:
-        row = cur.execute("SELECT flag FROM custom_countries WHERE name=?", (name,)).fetchone()
-        if row: return row[0]
+        document = mongo_store.custom_country_by_name(name)
+        if document: return document.get("flag")
     except: pass
     return "🌍"
 
@@ -843,10 +868,12 @@ def get_country_info(phone):
     if not phone: return "Unknown", "🌍"
     
     try:
-        customs = cur.execute("SELECT code, name, flag FROM custom_countries").fetchall()
-        customs.sort(key=lambda x: len(x[0]), reverse=True)
-        for code, name, flag in customs:
-            if phone.startswith(code): return name, flag
+        customs = mongo_store.list_custom_countries()
+        customs.sort(key=lambda document: len(str(document.get("code", ""))), reverse=True)
+        for document in customs:
+            code = str(document.get("code", ""))
+            if phone.startswith(code):
+                return document.get("name"), document.get("flag")
     except: pass
 
     for length in (3, 2, 1):
@@ -875,11 +902,11 @@ async def detect_account_year(client):
 
 # ================= LOGGING LOGIC =================
 async def process_referral_bonus(uid, amount):
-    row = cur.execute("SELECT referred_by FROM users WHERE user_id=?", (uid,)).fetchone()
-    ref = row[0] if row else None
+    user = mongo_store.get_user(uid, {"referred_by": 1})
+    ref = user.get("referred_by") if user else None
     if ref:
-        pct_row = cur.execute("SELECT value FROM settings WHERE key='ref_percent'").fetchone()
-        pct = float(pct_row[0]) if pct_row else 3.0
+        pct_value = get_setting("ref_percent")
+        pct = float(pct_value) if pct_value is not None else 3.0
         if pct > 0:
             bonus = int(amount * (pct / 100))
             if bonus > 0:
@@ -971,8 +998,7 @@ def get_join_buttons():
 
 async def send_main_menu(event, uid):
     me = await bot.get_me()
-    pct_row = cur.execute("SELECT value FROM settings WHERE key='ref_percent'").fetchone()
-    pct = pct_row[0] if pct_row else "3"
+    pct = get_setting("ref_percent", "3")
     bot_username = me.username or ""
     msg = get_welcome_message(uid, pct, bot_username)
     banner = get_banner_media() if get_setting("images_enabled", "off") == "on" else None
@@ -1015,9 +1041,9 @@ async def deposit_menu(event):
         Button.inline(f"👛 Cwallet (+5%)", "depm_Cwallet")
     ]
     
-    customs = cur.execute("SELECT name FROM custom_payments").fetchall()
-    for c in customs:
-        flat_buttons.append(Button.inline(f"💳 {c[0]}", f"depm_{c[0]}"))
+    customs = mongo_store.list_custom_payments()
+    for payment in customs:
+        flat_buttons.append(Button.inline(f"💳 {payment['name']}", f"depm_{payment['name']}"))
     
     btns = format_payment_buttons(flat_buttons)
     await bot.send_message(event.chat_id, msg, buttons=btns)
@@ -1515,8 +1541,7 @@ async def show_years(event, flow, country):
     if not rows: return await event.answer("❌ Out of stock for this country.", alert=True)
 
     uid = event.sender_id
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    discount = get_user_discount(uid)
 
     msg = f"{PE_FLOWER} <b>Select Account Year</b>\n{P_GLOBE} Country: <b>{country}</b>\n\n"
     btns = []
@@ -1533,10 +1558,8 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
     uid = event.sender_id
     base_price = int(price_str)
     
-    bal_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
-    bal = bal_row[0] if bal_row else 0
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    bal = get_user_balance(uid)
+    discount = get_user_discount(uid)
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
     msg = (f"{PE_CHECK} <b>Confirm Your Purchase</b>\n\n"
@@ -1557,8 +1580,7 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
 async def process_purchase(event, country, year_str, price_str, category=None, dc=None):
     uid, base_price = event.sender_id, int(price_str)
 
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    discount = get_user_discount(uid)
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
     columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
@@ -1709,8 +1731,7 @@ async def init_session_purchase(event, country, year, price_str, category=None, 
     if stock == 0: return await event.answer("❌ Out of stock!", alert=True)
     
     session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock, 'category': category, 'dc': dc}
-    disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    discount = disc_row[0] if disc_row else 0
+    discount = get_user_discount(uid)
     p_disp = price if discount == 0 else int(price * (100 - discount) / 100)
     
     msg = (f"{PE_GIFT} <b>Buy {country} ({year}) Sessions</b>\n\n"
@@ -1785,12 +1806,15 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
 # ================= STATS & PROFILE FUNCTIONS =================
 async def profile_handler(event):
     uid = event.sender_id
-    row = cur.execute("SELECT balance, total_deposited, joined_date, discount FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: return await bot.send_message(event.chat_id, "⚠️ Error: Please type /start to initialize your account.")
-    
-    bal, dep, date, discount = row
-    ref_count_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
-    ref_count = ref_count_row[0] if ref_count_row else 0
+    user = mongo_store.get_user(uid)
+    if not user:
+        return await bot.send_message(event.chat_id, "⚠️ Error: Please type /start to initialize your account.")
+    balance_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
+    bal = balance_row[0] if balance_row else 0
+    dep = user.get("total_deposited", 0) or 0
+    date = user.get("joined_date") or ""
+    discount = user.get("discount", 0) or 0
+    ref_count = mongo_store.count_referrals(uid)
     me = await bot.get_me()
     bot_username = me.username or ""
     ref_link = f"https://t.me/{bot_username}?start=ref_{uid}" if bot_username else None
@@ -1811,14 +1835,13 @@ async def profile_handler(event):
 
 async def stats_handler(event, is_callback=False):
     uid = event.sender_id
-    row = cur.execute("SELECT total_deposited FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not row: return
-    dep = row[0]
+    user = mongo_store.get_user(uid, {"total_deposited": 1})
+    if not user: return
+    dep = user.get("total_deposited", 0) or 0
     o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE user_id=?", (uid,)).fetchone()
     total_orders = o_row[0] if o_row else 0
     spent = o_row[1] if o_row and o_row[1] else 0
-    ref_row = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,)).fetchone()
-    ref_count = ref_row[0] if ref_row else 0
+    ref_count = mongo_store.count_referrals(uid)
     
     msg = (f"{PE_CROWN} <b>My Statistics</b>\n\n"
            f"{P_CART} <b>Accounts Bought:</b> {total_orders}\n"
@@ -1857,8 +1880,8 @@ async def send_purchase_page(event, uid, page):
     await event.edit(msg, buttons=[nav])
 
 async def view_referrals(event):
-    refs = cur.execute("SELECT user_id FROM users WHERE referred_by=?", (event.sender_id,)).fetchall()
-    await event.answer(f"👥 You have referred {len(refs)} user(s).", alert=True)
+    ref_count = mongo_store.count_referrals(event.sender_id)
+    await event.answer(f"👥 You have referred {ref_count} user(s).", alert=True)
 
 # ================= ADMIN ACTIONS =================
 async def admin_panel_handler(event):
@@ -1866,7 +1889,7 @@ async def admin_panel_handler(event):
     if not is_admin(uid): return
     
     status_text = "🟢 Bot is ON" if is_bot_online() else "🔴 Bot is OFF"
-    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    total_users = mongo_store.count_users()
     total_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
     pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     btns = []
@@ -1946,11 +1969,15 @@ async def general_settings_menu(event):
     await event.edit(msg, buttons=buttons)
 
 def get_stats_period(period):
+    now = datetime.utcnow()
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week = start_today - timedelta(days=start_today.weekday())
+    start_month = start_today.replace(day=1)
     periods = {
-        "today": ("Today", "date('now', 'start of day')"),
-        "week": ("This Week", "date('now', '-' || ((cast(strftime('%w', 'now') as integer) + 6) % 7) || ' days')"),
-        "month": ("This Month", "date('now', 'start of month')"),
-        "all": ("All Time", "NULL")
+        "today": ("Today", start_today.strftime("%Y-%m-%d %H:%M:%S")),
+        "week": ("This Week", start_week.strftime("%Y-%m-%d %H:%M:%S")),
+        "month": ("This Month", start_month.strftime("%Y-%m-%d %H:%M:%S")),
+        "all": ("All Time", None),
     }
     return periods.get(period, periods["all"])
 
@@ -1958,21 +1985,23 @@ async def render_admin_stats(event, period="all"):
     if not has_perm(event.sender_id, 'p_stats'):
         return await event.answer("Not authorized.", alert=True)
     label, since = get_stats_period(period)
-    date_filter = "" if period == "all" else " AND date >= " + since
-    user_filter = "" if period == "all" else " WHERE joined_date >= " + since
+    date_filter = "" if period == "all" else " AND date >= '" + since + "'"
 
-    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    period_users = cur.execute("SELECT COUNT(*) FROM users" + user_filter).fetchone()[0]
-    banned_users = cur.execute("SELECT COUNT(*) FROM users WHERE banned=1").fetchone()[0]
+    total_users = mongo_store.count_users()
+    period_users = (
+        mongo_store.count_users({"joined_date": {"$gte": since}})
+        if period != "all"
+        else total_users
+    )
+    banned_users = mongo_store.count_users({"banned": 1})
+    # Balance mutations remain in the deferred SQLite balance phase.
     total_balance = cur.execute("SELECT COALESCE(SUM(balance), 0) FROM users").fetchone()[0]
     total_upi_revenue = get_setting("upi_revenue", "0")
 
     deposit_row = cur.execute(
         "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE status='approved'" + date_filter
     ).fetchone()
-    total_deposits = cur.execute(
-        "SELECT COALESCE(SUM(total_deposited), 0) FROM users"
-    ).fetchone()[0]
+    total_deposits = mongo_store.sum_user_field("total_deposited")
     period_deposit_count, period_deposits = deposit_row
 
     order_row = cur.execute(
@@ -1983,13 +2012,15 @@ async def render_admin_stats(event, period="all"):
         "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders"
     ).fetchone()
 
-    referral_filter = "" if period == "all" else " AND joined_date >= " + since
-    total_referrals = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL").fetchone()[0]
-    period_referrals = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL" + referral_filter).fetchone()[0]
-    top_referrers = cur.execute(
-        "SELECT referred_by, COUNT(*) AS referrals FROM users "
-        "WHERE referred_by IS NOT NULL GROUP BY referred_by ORDER BY referrals DESC LIMIT 3"
-    ).fetchall()
+    total_referrals = mongo_store.count_referrals()
+    period_referrals = (
+        mongo_store.count_users(
+            {"referred_by": {"$ne": None}, "joined_date": {"$gte": since}}
+        )
+        if period != "all"
+        else total_referrals
+    )
+    top_referrers = mongo_store.top_referrers()
 
     available_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
     used_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=0").fetchone()[0]
@@ -2029,7 +2060,7 @@ async def render_admin_stats(event, period="all"):
     await event.edit(msg, buttons=buttons)
 
 async def manage_admins_menu(event):
-    rows = cur.execute("SELECT user_id FROM admins").fetchall()
+    rows = [(user_id,) for user_id in mongo_store.list_admin_ids()]
     msg = f"{PE_CROWN} <b>Manage Sub-Admins</b>\n\n"
     for r in rows: msg += f"{P_ACC} <code>{r[0]}</code>\n"
     btns = [[Button.inline("Add Admin", "adm_addadmin"), Button.inline("Edit Admin", "adm_editadminreq")],
@@ -2037,14 +2068,18 @@ async def manage_admins_menu(event):
     await event.edit(msg, buttons=btns)
 
 async def render_user_management(event, target_id):
-    row = cur.execute(
-        "SELECT user_id, balance, referred_by, total_deposited, joined_date, banned, discount "
-        "FROM users WHERE user_id=?", (target_id,)
-    ).fetchone()
-    if not row:
+    user = mongo_store.get_user(target_id)
+    if not user:
         return await event.edit(f"{P_NO} <b>User not found.</b>", buttons=[[Button.inline("Back", "adm_adminmain")]])
 
-    user_id, balance, referred_by, deposited, joined, banned, discount = row
+    user_id = int(user["_id"])
+    balance_row = cur.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+    balance = balance_row[0] if balance_row else 0
+    referred_by = user.get("referred_by")
+    deposited = user.get("total_deposited", 0) or 0
+    joined = user.get("joined_date") or ""
+    banned = user.get("banned", 0) or 0
+    discount = user.get("discount", 0) or 0
     username = "Not available"
     name = "Not available"
     try:
@@ -2058,7 +2093,7 @@ async def render_user_management(event, target_id):
     deposit_row = cur.execute(
         "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM deposits WHERE user_id=? AND status='approved'", (user_id,)
     ).fetchone()
-    referral_count = cur.execute("SELECT COUNT(*) FROM users WHERE referred_by=?", (user_id,)).fetchone()[0]
+    referral_count = mongo_store.count_referrals(user_id)
     order_count, spent = order_row
     approved_count, approved_total = deposit_row
 
@@ -2102,7 +2137,7 @@ async def start_user_search(event, action):
             if not value.isdigit() or int(value) <= 0:
                 return await conv.send_message(f"{P_NO} Enter a valid numeric Telegram user ID.")
             target_id = int(value)
-            if not cur.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)).fetchone():
+            if not mongo_store.get_user(target_id, {"_id": 1}):
                 return await conv.send_message(f"{P_NO} <b>User not found.</b>")
             if action == "balance":
                 await conv.send_message(
@@ -2171,9 +2206,12 @@ async def start_balance_for_user(event, target_id):
             await conv.send_message(f"{P_NO} Timed out. Please try again.")
 
 async def edit_admin_menu(event, target_id):
-    row = cur.execute("SELECT p_add_stock, p_manage_stock, p_stats, p_bal, p_settings FROM admins WHERE user_id=?", (target_id,)).fetchone()
-    if not row: return await event.answer("Admin not found", alert=True)
-    p = ["✅" if x==1 else "❌" for x in row]
+    admin = mongo_store.get_admin(target_id)
+    if not admin: return await event.answer("Admin not found", alert=True)
+    p = [
+        "✅" if admin.get(permission, 0) == 1 else "❌"
+        for permission in ("p_add_stock", "p_manage_stock", "p_stats", "p_bal", "p_settings")
+    ]
     
     btns = [
         [Button.inline(f"Add Stock: {p[0]}", f"adm_tglperm|{target_id}|p_add_stock")],
@@ -2226,8 +2264,10 @@ async def send_autoprice_page(event, page):
     db_countries = cur.execute("SELECT DISTINCT country_name FROM stock").fetchall()
     for (c,) in db_countries: c_list.add(c)
     
-    custom_countries = cur.execute("SELECT DISTINCT name FROM custom_countries").fetchall()
-    for (c,) in custom_countries: c_list.add(c)
+    custom_countries = mongo_store.list_custom_countries()
+    for country in custom_countries:
+        if country.get("name"):
+            c_list.add(country["name"])
 
     c_list = sorted(list(c_list))
     total = len(c_list)
@@ -2468,10 +2508,10 @@ async def admin_actions(event):
             return await event.answer("Not authorized.", alert=True)
         _, target_text, desired_text = action_data.split("|")
         target_id, desired = int(target_text), int(desired_text)
-        row = cur.execute("SELECT banned FROM users WHERE user_id=?", (target_id,)).fetchone()
-        if not row:
+        user = mongo_store.get_user(target_id, {"banned": 1})
+        if not user:
             return await event.answer("User not found.", alert=True)
-        if row[0] != desired:
+        if user.get("banned", 0) != desired:
             return await render_user_management(event, target_id)
         admin_user_state[uid] = {"ban_target": target_id, "ban_value": desired}
         verb = "ban" if desired else "unban"
@@ -2488,8 +2528,7 @@ async def admin_actions(event):
         pending = admin_user_state.pop(uid, None)
         if not pending or pending.get("ban_target") != target_id or pending.get("ban_value") != desired:
             return await event.answer("This confirmation has expired.", alert=True)
-        cur.execute("UPDATE users SET banned=? WHERE user_id=?", (desired, target_id))
-        db.commit()
+        mongo_store.set_user_fields(target_id, {"banned": desired})
         await event.answer("User status updated.", alert=True)
         return await render_user_management(event, target_id)
 
@@ -2590,8 +2629,7 @@ async def admin_actions(event):
 
     if action_data == "togglebot" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         new_status = 'off' if is_bot_online() else 'on'
-        cur.execute("UPDATE settings SET value=? WHERE key='bot_status'", (new_status,))
-        db.commit()
+        set_setting("bot_status", new_status)
         await event.answer(f"Bot turned {new_status.upper()}", alert=True)
         class FakeEvent: chat_id = chat; sender_id = uid
         await admin_panel_handler(FakeEvent())
@@ -2617,14 +2655,14 @@ async def admin_actions(event):
 
     elif action_data.startswith("tglperm|") and uid in ADMIN_IDS:
         _, t_id, p_name = action_data.split("|")
-        cur.execute(f"UPDATE admins SET {p_name} = CASE WHEN {p_name}=1 THEN 0 ELSE 1 END WHERE user_id=?", (t_id,))
-        db.commit()
+        if p_name not in {"p_add_stock", "p_manage_stock", "p_stats", "p_bal", "p_settings"}:
+            return await event.answer("Invalid permission.", alert=True)
+        mongo_store.toggle_permission(int(t_id), p_name)
         return await edit_admin_menu(event, t_id)
         
     elif action_data.startswith("deladmin|") and uid in ADMIN_IDS:
         t_id = action_data.split("|")[1]
-        cur.execute("DELETE FROM admins WHERE user_id=?", (t_id,))
-        db.commit()
+        mongo_store.delete_admin(int(t_id))
         await event.answer("✅ Admin Removed", alert=True)
         return await manage_admins_menu(event)
 
@@ -2642,9 +2680,27 @@ async def admin_actions(event):
         return await send_autoprice_country(event, action_data.split("|")[1])
         
     elif action_data == "backupusr" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
-        cur.execute("SELECT * FROM users")
         with open("users_backup.csv", "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f); w.writerow([i[0] for i in cur.description]); w.writerows(cur.fetchall())
+            fields = [
+                "user_id", "balance", "referred_by", "total_deposited",
+                "joined_date", "banned", "discount", "terms_accepted",
+            ]
+            w = csv.writer(f)
+            w.writerow(fields)
+            for user in mongo_store.list_users():
+                balance_row = cur.execute(
+                    "SELECT balance FROM users WHERE user_id=?", (user["_id"],)
+                ).fetchone()
+                w.writerow([
+                    user["_id"],
+                    balance_row[0] if balance_row else 0,
+                    user.get("referred_by"),
+                    user.get("total_deposited", 0),
+                    user.get("joined_date"),
+                    user.get("banned", 0),
+                    user.get("discount", 0),
+                    user.get("terms_accepted", 0),
+                ])
         await bot.send_file(chat, "users_backup.csv", caption=f"{P_USERS} <b>Users Backup CSV</b>")
         os.remove("users_backup.csv")
         return await event.answer("✅ Backup Generated!", alert=True)
@@ -2662,14 +2718,12 @@ async def admin_actions(event):
                 flag = html.escape((await get_reply(f"{P_FLAG} <b>Enter Country Flag Emoji:</b>\n<i>Example: 🇮🇳</i>")).text.strip())
                 name = html.escape((await get_reply(f"{P_GLOBE} <b>Enter Country Name:</b>\n<i>Example: India</i>")).text.strip())
                 
-                cur.execute("INSERT OR REPLACE INTO custom_countries (code, name, flag) VALUES (?,?,?)", (code, name, flag))
-                db.commit()
+                mongo_store.save_custom_country(code, name, flag)
                 await conv.send_message(f"{P_YES} <b>Custom Country Added Successfully!</b>\n{flag} {name} (+{code})\n\n<i>It will now automatically be recognized when adding stock!</i>")
 
             elif action_data == "addadmin" and uid in ADMIN_IDS:
                 new_ad = int((await get_reply(f"{P_ACC} <b>Enter User ID for new Admin:</b>")).text)
-                cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_ad,))
-                db.commit()
+                mongo_store.add_admin(new_ad)
                 await conv.send_message(f"{P_YES} Admin added!")
                 class FakeEvent: 
                     async def edit(self, text, buttons): await bot.send_message(chat, text, buttons=buttons)
@@ -2751,22 +2805,27 @@ async def admin_actions(event):
                 
                 cap_msg = (await get_reply(f"{P_DOC} <b>Enter Payment Caption:</b>\n<i>(Use <code>text</code> to make wallet IDs or UPI copyable)</i>")).text
                 cap_msg = html.escape(cap_msg).replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
-                cur.execute("INSERT INTO custom_payments (name, caption, qr_file_id) VALUES (?,?,?)", (name, cap_msg, qr_path))
-                db.commit()
+                mongo_store.add_custom_payment(name, cap_msg, qr_path)
                 await conv.send_message(f"{P_YES} Payment Method '{name}' added successfully!")
 
             elif action_data == "delpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
-                rows = cur.execute("SELECT id, name FROM custom_payments").fetchall()
+                rows = [
+                    (payment["_id"], payment["name"])
+                    for payment in mongo_store.list_custom_payments()
+                ]
                 if not rows: return await conv.send_message(f"{P_NO} No custom payment methods.")
                 msg = f"{P_DOC} <b>Reply with the ID of the method to delete:</b>\n\n"
                 for r in rows: msg += f"ID: {r[0]} - {r[1]}\n"
                 del_id = (await get_reply(msg)).text
                 try:
-                    del_id = int(del_id)
-                    file_path = cur.execute("SELECT qr_file_id FROM custom_payments WHERE id=?", (del_id,)).fetchone()
-                    if file_path and file_path[0] and os.path.exists(file_path[0]): os.remove(file_path[0])
-                    cur.execute("DELETE FROM custom_payments WHERE id=?", (del_id,))
-                    db.commit()
+                    del_id = del_id.strip()
+                    payment = mongo_store.get_custom_payment_by_id(del_id)
+                    file_path = payment.get("qr_file_id") if payment else None
+                    if file_path and os.path.exists(file_path):
+                        os.remove(file_path)
+                    if not payment:
+                        raise ValueError
+                    mongo_store.delete_custom_payment(payment["_id"])
                     await conv.send_message(f"{P_YES} Deleted!")
                 except: await conv.send_message(f"{P_NO} Invalid ID.")
 
@@ -2938,8 +2997,7 @@ async def admin_actions(event):
             elif action_data == "supporturl" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 url = (await get_reply("🔗 Enter new Support URL (must start with http:// or https://):")).text
                 if not url.startswith("http"): url = "https://" + url.replace("@", "t.me/")
-                cur.execute("UPDATE settings SET value=? WHERE key='support_url'", (url,))
-                db.commit()
+                set_setting("support_url", url)
                 await conv.send_message(f"{P_YES} Support URL updated.")
 
             elif action_data == "bcast" and (uid in ADMIN_IDS or has_perm(uid, 'p_stats')):
@@ -2961,20 +3019,19 @@ async def admin_actions(event):
             elif action_data == "discount" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 t_uid = int((await get_reply(f"{P_ACC} <b>User ID:</b>")).text)
                 pct = int((await get_reply(f"{P_GIFT} <b>Discount % (0 to remove):</b>")).text)
-                cur.execute("UPDATE users SET discount=? WHERE user_id=?", (pct, t_uid))
-                db.commit()
+                if not mongo_store.set_user_fields(t_uid, {"discount": pct}):
+                    await conv.send_message(f"{P_NO} User not found.")
+                    return
                 await conv.send_message(f"{P_YES} User {t_uid} has {pct}% discount.")
                 
             elif action_data == "refpct" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 pct = int((await get_reply(f"{P_USERS} <b>New Referral %:</b>")).text)
-                cur.execute("UPDATE settings SET value=? WHERE key='ref_percent'", (str(pct),))
-                db.commit()
+                set_setting("ref_percent", str(pct))
                 await conv.send_message(f"{P_YES} Ref revenue set to {pct}%.")
 
             elif action_data == "usdtrate" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 r = float((await get_reply(f"{P_USDT} <b>New USDT Rate (INR):</b>")).text)
-                cur.execute("UPDATE settings SET value=? WHERE key='usdt_rate'", (str(r),))
-                db.commit()
+                set_setting("usdt_rate", str(r))
                 await conv.send_message(f"{P_YES} Rate set to {r}.")
 
             elif action_data == "restoreusr" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
@@ -2985,11 +3042,24 @@ async def admin_actions(event):
                     reader = csv.reader(f); next(reader); count = 0
                     for row in reader:
                         try:
-                            cur.execute("INSERT OR REPLACE INTO users (user_id, balance, referred_by, total_deposited, joined_date, banned, discount, terms_accepted) VALUES (?,?,?,?,?,?,?,?)", 
-                                        (int(row[0]), int(row[1]), row[2] if row[2] else None, int(row[3]), row[4], int(row[5]), int(row[6]), int(row[7])))
-                            count += 1
+                            user_id = int(row[0])
+                            user_document = {
+                                "_id": user_id,
+                                "referred_by": int(row[2]) if row[2] else None,
+                                "total_deposited": int(row[3]),
+                                "joined_date": row[4],
+                                "banned": int(row[5]),
+                                "discount": int(row[6]),
+                                "terms_accepted": int(row[7]),
+                            }
+                            if mongo_store.insert_user_if_missing(user_document):
+                                cur.execute(
+                                    "INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)",
+                                    (user_id, int(row[1])),
+                                )
+                                db.commit()
+                                count += 1
                         except: pass
-                db.commit()
                 os.remove("temp_restore.csv")
                 await conv.send_message(f"{P_YES} Restored {count} users.")
 
@@ -3018,8 +3088,7 @@ async def handle_start(e):
             if start_param.startswith("ref_"):
                 ref = start_param.replace("ref_", "")
                 if ref.isdigit() and int(ref) != uid:
-                    cur.execute("UPDATE users SET referred_by=? WHERE user_id=? AND referred_by IS NULL", (int(ref), uid))
-                    db.commit()
+                    mongo_store.set_referred_by_if_empty(uid, int(ref))
 
         is_joined = await check_channel_joined(uid)
         if not is_joined:
@@ -3030,8 +3099,7 @@ async def handle_start(e):
                    "Thank you for supporting us ❤️")
             return await e.respond(msg, buttons=get_join_buttons())
 
-        row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
-        terms_acc = row[0] if row else 0
+        terms_acc = get_user_terms_accepted(uid)
         if not terms_acc:
             msg = f"{PE_FLOWER} <b>TERMS & CONDITIONS</b>\nPlease read and accept our Terms & Conditions before using the bot."
             return await e.respond(msg, buttons=get_terms_buttons())
@@ -3192,8 +3260,7 @@ async def handle_all_messages(e):
                 if qty < 1: raise ValueError
                 if qty > state['stock']: return await e.respond(f"{P_WARN} <b>Not enough stock!</b> Max is {state['stock']}.")
                 
-                disc_row = cur.execute("SELECT discount FROM users WHERE user_id=?", (uid,)).fetchone()
-                discount = disc_row[0] if disc_row else 0
+                discount = get_user_discount(uid)
                 total_cost = qty * state['price']
                 if discount > 0: total_cost = int(total_cost * (100 - discount) / 100)
                     
@@ -3245,12 +3312,13 @@ async def handle_all_messages(e):
                     if method == "UPI":
                         return await show_upi_qr(event, amt)
                     else:
-                        row = cur.execute("SELECT caption, qr_file_id FROM custom_payments WHERE name=?", (method,)).fetchone()
-                        if row:
-                            cap = row[0] + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
+                        payment = mongo_store.get_custom_payment(method)
+                        if payment:
+                            cap = payment.get("caption", "") + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
                             btns = [[Button.inline("❌ Cancel", "cancel_action")]]
-                            if row[1] and os.path.exists(row[1]): 
-                                try: await bot.send_file(e.chat_id, row[1], caption=cap, buttons=btns)
+                            qr_file_id = payment.get("qr_file_id")
+                            if qr_file_id and os.path.exists(qr_file_id):
+                                try: await bot.send_file(e.chat_id, qr_file_id, caption=cap, buttons=btns)
                                 except: await e.reply(cap, buttons=btns)
                             else: await e.reply(cap, buttons=btns)
                         else: 
@@ -3292,8 +3360,7 @@ async def handle_callback_query(e):
 
         if data == "verify_join":
             if not await check_channel_joined(uid): return await e.answer("⚠️ You must join the channels first!", alert=True)
-            row = cur.execute("SELECT terms_accepted FROM users WHERE user_id=?", (uid,)).fetchone()
-            terms = row[0] if row else 0
+            terms = get_user_terms_accepted(uid)
             if not terms:
                 msg = f"{PE_FLOWER} <b>TERMS & CONDITIONS</b>\nPlease read and accept our Terms & Conditions before using the bot."
                 try: await e.edit(msg, buttons=get_terms_buttons())
@@ -3302,8 +3369,7 @@ async def handle_callback_query(e):
             await send_main_menu(e, uid)
 
         elif data == "tc_accept":
-            cur.execute("UPDATE users SET terms_accepted=1 WHERE user_id=?", (uid,))
-            db.commit()
+            mongo_store.set_user_fields(uid, {"terms_accepted": 1})
             await e.answer("✅ Terms Accepted!", alert=True)
             await send_main_menu(e, uid)
             
@@ -3481,6 +3547,7 @@ async def handle_callback_query(e):
                     cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
                     cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
                     db.commit()
+                    mongo_store.increment_user_field(t_uid, "total_deposited", amt)
                     
                 await process_referral_bonus(t_uid, amt)
                 await e.edit(f"{PE_CHECK} <b>APPROVED {P_INR}{amt} TO {t_uid} (Custom Amount)</b>")
@@ -3506,6 +3573,7 @@ async def handle_callback_query(e):
                     cur.execute("UPDATE deposits SET status='approved', amount=? WHERE id=?", (amt, dep_id))
                     cur.execute("UPDATE users SET total_deposited = total_deposited + ? WHERE user_id=?", (amt, t_uid))
                     db.commit()
+                    mongo_store.increment_user_field(t_uid, "total_deposited", amt)
                 
                 await process_referral_bonus(t_uid, amt)
                 

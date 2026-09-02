@@ -6,6 +6,7 @@ from pathlib import Path
 from mongo_persistence import (
     COLLECTION_NAMES,
     MongoRepository,
+    MongoRuntimeStore,
     SQLiteMongoMigrator,
     managed_projection,
     sqlite_connection_read_only,
@@ -18,20 +19,91 @@ class FakeCollection:
         self.documents = []
         self.indexes = [{"name": "_id_", "key": {"_id": 1}, "unique": True}]
 
-    def find(self, query=None):
+    @staticmethod
+    def matches(document, query):
+        for key, value in (query or {}).items():
+            if key == "$or":
+                if not any(FakeCollection.matches(document, item) for item in value):
+                    return False
+                continue
+            actual = document.get(key)
+            if isinstance(value, dict):
+                if "$ne" in value and actual == value["$ne"]:
+                    return False
+                if "$exists" in value and (key in document) != value["$exists"]:
+                    return False
+                continue
+            if actual != value:
+                return False
+        return True
+
+    def find(self, query=None, projection=None):
         query = query or {}
         return [
             document.copy()
             for document in self.documents
-            if all(document.get(key) == value for key, value in query.items())
+            if self.matches(document, query)
         ]
 
-    def find_one(self, query=None):
-        matches = self.find(query)
+    def find_one(self, query=None, projection=None):
+        matches = self.find(query, projection)
         return matches[0] if matches else None
 
     def insert_one(self, document):
-        self.documents.append(document.copy())
+        stored = document.copy()
+        if "_id" not in stored:
+            stored["_id"] = len(self.documents) + 1
+        self.documents.append(stored)
+        return type(
+            "InsertOneResult",
+            (),
+            {"inserted_id": stored.get("_id")},
+        )()
+
+    def update_one(self, query, update, upsert=False):
+        document = next(
+            (item for item in self.documents if self.matches(item, query)),
+            None,
+        )
+        inserted = False
+        if document is None and upsert:
+            document = {
+                key: value for key, value in query.items()
+                if not key.startswith("$") and not isinstance(value, dict)
+            }
+            self.documents.append(document)
+            inserted = True
+        if document is None:
+            return type("UpdateResult", (), {"matched_count": 0, "modified_count": 0, "upserted_id": None})()
+
+        before = document.copy()
+        if inserted:
+            document.update(update.get("$setOnInsert", {}))
+        document.update(update.get("$set", {}))
+        for key, amount in update.get("$inc", {}).items():
+            document[key] = document.get(key, 0) + amount
+        for key, operation in update.get("$bit", {}).items():
+            if "xor" in operation:
+                document[key] = int(document.get(key, 0)) ^ int(operation["xor"])
+        return type(
+            "UpdateResult",
+            (),
+            {
+                "matched_count": 1,
+                "modified_count": int(document != before),
+                "upserted_id": document.get("_id") if inserted else None,
+            },
+        )()
+
+    def delete_one(self, query):
+        for index, document in enumerate(self.documents):
+            if self.matches(document, query):
+                self.documents.pop(index)
+                return type("DeleteResult", (), {"deleted_count": 1})()
+        return type("DeleteResult", (), {"deleted_count": 0})()
+
+    def count_documents(self, query=None):
+        return len(self.find(query))
 
     def create_index(self, keys, name, unique=False):
         self.indexes.append(
@@ -262,6 +334,41 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertEqual(result["status"], "conflict")
         self.assertEqual(database["counters"].find_one({"_id": "orders"})["value"], 4)
         self.assertEqual(repository.allocate_counter("orders"), 5)
+
+    def test_runtime_store_preserves_existing_user_fields_and_uses_string_settings(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        store = MongoRuntimeStore(repository)
+
+        store.users.documents.append({"_id": 7, "balance": 900, "discount": 5})
+        store.ensure_user(7)
+        self.assertEqual(store.get_user(7)["balance"], 900)
+        self.assertEqual(store.get_user(7)["discount"], 5)
+
+        store.ensure_user(8)
+        self.assertEqual(store.get_user(8)["balance"], 0)
+        store.set_setting("usdt_rate", 83.5)
+        self.assertEqual(store.get_setting("usdt_rate"), "83.5")
+
+    def test_runtime_store_handles_admins_custom_countries_and_payments(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        store = MongoRuntimeStore(repository)
+
+        store.add_admin(42)
+        self.assertTrue(store.is_admin(42))
+        self.assertFalse(store.has_permission(42, "p_stats"))
+        store.toggle_permission(42, "p_stats")
+        self.assertTrue(store.has_permission(42, "p_stats"))
+
+        store.save_custom_country("999", "Testland", "🏳️")
+        self.assertEqual(store.custom_country_by_name("Testland")["flag"], "🏳️")
+        payment_id = store.add_custom_payment("Test Pay", "<code>pay</code>", "")
+        self.assertEqual(store.get_custom_payment("Test Pay")["_id"], payment_id)
+        store.delete_custom_payment(payment_id)
+        self.assertIsNone(store.get_custom_payment("Test Pay"))
 
 
 if __name__ == "__main__":

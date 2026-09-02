@@ -11,11 +11,13 @@ environment variables before starting the workflow. The same command is used
 as the Render background-worker start command.
 
 The bot keeps its existing SQLite database file, session files, and screenshots
-directories unchanged.
+directories unchanged. MongoDB is required at startup and is used for users,
+settings, admin permissions, custom countries, and custom payment definitions.
+Inventory, deposits, orders, and balance mutations remain on SQLite for now.
 
 ## Required environment variable names
 
-`BOT_TOKEN`, `API_ID`, `API_HASH`, `ADMIN_ID`, `LOG_CHANNEL_ID`,
+`BOT_TOKEN`, `API_ID`, `API_HASH`, `ADMIN_ID`, `MONGODB_URI`, `LOG_CHANNEL_ID`,
 `CHECK_CHANNELS`, `JOIN_URLS`, `TERMS_URL`, `UPI_ID`, `UPI_QR`, `CWALLET_QR`,
 `CWALLET_ID`, `SUPPORT_USERNAME_1`, `SUPPORT_USERNAME_2`, `OTP_REGEX`,
 `AUTO_CANCEL_SECONDS`, `DEFAULT_USDT_RATE`, and `DEFAULT_SUPPORT_URL`.

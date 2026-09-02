@@ -1,0 +1,1 @@
+- [Mongo runtime boundary](mongo-runtime-boundary.md) — selected account/config collections use Mongo; financial and order flows remain SQLite until dedicated migrations.

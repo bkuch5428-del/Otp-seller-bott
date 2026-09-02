@@ -1,4 +1,4 @@
-"""Non-runtime MongoDB infrastructure for the staged SQLite migration.
+"""MongoDB infrastructure for the staged SQLite-to-MongoDB migration.
 
 This module deliberately does not import or modify the Telegram bot runtime.
 It provides:
@@ -7,15 +7,15 @@ It provides:
 * safe collection/index preparation;
 * conflict-aware document comparison;
 * a non-destructive counter initializer; and
-* small repository helpers for future runtime cutover work.
+* runtime helpers for the selected user/settings/admin/custom-definition cutover.
 
-The application still uses SQLite until a later, explicitly approved phase.
+Inventory, deposits, orders, and balance mutations remain SQLite-backed until
+their dedicated migration phases.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -583,6 +583,272 @@ class MongoRepository:
         if not result or not isinstance(result.get("value"), int):
             raise RuntimeError(f"Counter did not return an integer: {counter_name}")
         return int(result["value"])
+
+
+class MongoRuntimeStore:
+    """Runtime accessors for the collections migrated in the first cutover.
+
+    This intentionally covers user metadata, settings, admin permissions,
+    custom countries, and custom payment definitions only. Inventory,
+    deposits, orders, and balance mutations remain in the legacy SQLite
+    runtime until their dedicated migration phases.
+    """
+
+    ADMIN_PERMISSIONS = {
+        "p_add_stock",
+        "p_manage_stock",
+        "p_stats",
+        "p_bal",
+        "p_settings",
+    }
+
+    USER_DEFAULTS = {
+        "balance": 0,
+        "referred_by": None,
+        "total_deposited": 0,
+        "banned": 0,
+        "joined_date": None,
+        "discount": 0,
+        "terms_accepted": 0,
+    }
+
+    def __init__(self, repository: MongoRepository):
+        self.repository = repository
+
+    @property
+    def users(self) -> Any:
+        return self.repository.collection("users")
+
+    @property
+    def settings(self) -> Any:
+        return self.repository.collection("settings")
+
+    @property
+    def admins(self) -> Any:
+        return self.repository.collection("admins")
+
+    @property
+    def custom_countries(self) -> Any:
+        return self.repository.collection("custom_countries")
+
+    @property
+    def custom_payments(self) -> Any:
+        return self.repository.collection("custom_payments")
+
+    def ensure_user(self, user_id: int) -> None:
+        """Create a user only when absent; never replace existing fields."""
+        self.users.update_one(
+            {"_id": int(user_id)},
+            {"$setOnInsert": dict(self.USER_DEFAULTS, _id=int(user_id))},
+            upsert=True,
+        )
+
+    def get_user(self, user_id: int, projection: Mapping[str, int] | None = None) -> Mapping[str, Any] | None:
+        return self.users.find_one({"_id": int(user_id)}, projection)
+
+    def list_users(self) -> list[Mapping[str, Any]]:
+        return list(self.users.find({}))
+
+    def list_user_ids(self) -> list[int]:
+        return [int(document["_id"]) for document in self.users.find({}, {"_id": 1})]
+
+    def count_users(self, filters: Mapping[str, Any] | None = None) -> int:
+        return int(self.users.count_documents(dict(filters or {})))
+
+    def sum_user_field(self, field: str) -> int:
+        result = list(
+            self.users.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total": {"$sum": {"$ifNull": [f"${field}", 0]}},
+                        }
+                    }
+                ]
+            )
+        )
+        return int(result[0]["total"]) if result else 0
+
+    def count_referrals(self, referred_by: int | None = None) -> int:
+        if referred_by is None:
+            filters = {"referred_by": {"$ne": None}}
+        else:
+            filters = {"referred_by": int(referred_by)}
+        return self.count_users(filters)
+
+    def top_referrers(self, limit: int = 3) -> list[tuple[Any, int]]:
+        result = self.users.aggregate(
+            [
+                {"$match": {"referred_by": {"$ne": None}}},
+                {"$group": {"_id": "$referred_by", "referrals": {"$sum": 1}}},
+                {"$sort": {"referrals": -1}},
+                {"$limit": int(limit)},
+            ]
+        )
+        return [
+            (document.get("_id"), int(document.get("referrals", 0)))
+            for document in result
+        ]
+
+    def set_user_fields(self, user_id: int, fields: Mapping[str, Any]) -> bool:
+        if not fields:
+            return False
+        result = self.users.update_one({"_id": int(user_id)}, {"$set": dict(fields)})
+        return bool(result.matched_count)
+
+    def increment_user_field(self, user_id: int, field: str, amount: int) -> bool:
+        if field not in {"total_deposited"}:
+            raise ValueError(f"Unknown incrementable user field: {field}")
+        result = self.users.update_one(
+            {"_id": int(user_id)},
+            {"$inc": {field: int(amount)}},
+        )
+        return bool(result.matched_count)
+
+    def set_referred_by_if_empty(self, user_id: int, referred_by: int) -> bool:
+        result = self.users.update_one(
+            {
+                "_id": int(user_id),
+                "$or": [{"referred_by": None}, {"referred_by": {"$exists": False}}],
+            },
+            {"$set": {"referred_by": int(referred_by)}},
+        )
+        return bool(result.modified_count)
+
+    def insert_user_if_missing(self, document: Mapping[str, Any]) -> bool:
+        """Insert a backup row only when absent; conflicting data is untouched."""
+        if "_id" not in document:
+            raise ValueError("user backup document is missing _id")
+        result = self.users.update_one(
+            {"_id": document["_id"]},
+            {"$setOnInsert": dict(document)},
+            upsert=True,
+        )
+        return bool(getattr(result, "upserted_id", None) is not None)
+
+    def get_setting(self, key: str, default: Any = None) -> Any:
+        document = self.settings.find_one({"_id": str(key)}, {"value": 1})
+        return document["value"] if document and "value" in document else default
+
+    def set_setting(self, key: str, value: Any) -> None:
+        # SQLite's TEXT column stores numeric inputs as text. Match that
+        # behavior while leaving already-stored Mongo values untouched.
+        stored_value = value if isinstance(value, str) else str(value)
+        self.settings.update_one(
+            {"_id": str(key)},
+            {"$set": {"value": stored_value}},
+            upsert=True,
+        )
+
+    def delete_setting(self, key: str) -> None:
+        self.settings.delete_one({"_id": str(key)})
+
+    def is_admin(self, user_id: int) -> bool:
+        return self.admins.find_one({"_id": int(user_id)}, {"_id": 1}) is not None
+
+    def has_permission(self, user_id: int, permission: str) -> bool:
+        if permission not in self.ADMIN_PERMISSIONS:
+            raise ValueError(f"Unknown admin permission: {permission}")
+        document = self.admins.find_one({"_id": int(user_id)}, {permission: 1})
+        return bool(document and document.get(permission) == 1)
+
+    def list_admin_ids(self) -> list[int]:
+        return [int(document["_id"]) for document in self.admins.find({}, {"_id": 1})]
+
+    def get_admin(self, user_id: int) -> Mapping[str, Any] | None:
+        return self.admins.find_one({"_id": int(user_id)})
+
+    def add_admin(self, user_id: int) -> None:
+        self.admins.update_one(
+            {"_id": int(user_id)},
+            {
+                "$setOnInsert": {
+                    "_id": int(user_id),
+                    "user_id": int(user_id),
+                    "p_add_stock": 0,
+                    "p_manage_stock": 0,
+                    "p_stats": 0,
+                    "p_bal": 0,
+                    "p_settings": 0,
+                }
+            },
+            upsert=True,
+        )
+
+    def toggle_permission(self, user_id: int, permission: str) -> None:
+        if permission not in self.ADMIN_PERMISSIONS:
+            raise ValueError(f"Unknown admin permission: {permission}")
+        self.admins.update_one(
+            {"_id": int(user_id)},
+            {"$bit": {permission: {"xor": 1}}},
+        )
+
+    def delete_admin(self, user_id: int) -> None:
+        self.admins.delete_one({"_id": int(user_id)})
+
+    def custom_country_by_name(self, name: str) -> Mapping[str, Any] | None:
+        return self.custom_countries.find_one({"name": name})
+
+    def list_custom_countries(self) -> list[Mapping[str, Any]]:
+        return list(self.custom_countries.find({}))
+
+    def save_custom_country(self, code: str, name: str, flag: str) -> None:
+        self.custom_countries.update_one(
+            {"_id": str(code)},
+            {
+                "$set": {
+                    "code": str(code),
+                    "name": name,
+                    "flag": flag,
+                },
+                "$setOnInsert": {"_id": str(code)},
+            },
+            upsert=True,
+        )
+
+    def list_custom_payment_names(self) -> list[str]:
+        return [
+            document["name"]
+            for document in self.custom_payments.find({}, {"name": 1})
+            if document.get("name") is not None
+        ]
+
+    def get_custom_payment(self, name: str) -> Mapping[str, Any] | None:
+        return self.custom_payments.find_one({"name": name})
+
+    def list_custom_payments(self) -> list[Mapping[str, Any]]:
+        return list(self.custom_payments.find({}))
+
+    def add_custom_payment(self, name: str, caption: str, qr_file_id: str) -> Any:
+        document = {
+            "name": name,
+            "caption": caption,
+            "qr_file_id": qr_file_id,
+        }
+        result = self.custom_payments.insert_one(document)
+        return result.inserted_id
+
+    def get_custom_payment_by_id(self, payment_id: Any) -> Mapping[str, Any] | None:
+        candidates = [payment_id]
+        text_id = str(payment_id).strip()
+        if text_id.isdigit():
+            candidates.append(int(text_id))
+        try:
+            from bson import ObjectId
+
+            if ObjectId.is_valid(text_id):
+                candidates.append(ObjectId(text_id))
+        except ImportError:
+            pass
+        for candidate in candidates:
+            document = self.custom_payments.find_one({"_id": candidate})
+            if document is not None:
+                return document
+        return None
+
+    def delete_custom_payment(self, payment_id: Any) -> None:
+        self.custom_payments.delete_one({"_id": payment_id})
 
 
 def sqlite_max_ids(connection: sqlite3.Connection) -> dict[str, int]:

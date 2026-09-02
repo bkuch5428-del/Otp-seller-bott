@@ -13,6 +13,10 @@ services:
         sync: false
       - key: ADMIN_ID
         sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: otp_seller_bot
       - key: LOG_CHANNEL_ID
         sync: false
       - key: CHECK_CHANNELS
