@@ -3,11 +3,11 @@ name: Mongo runtime boundary
 description: Staged persistence boundary between MongoDB-backed runtime data and deferred SQLite business flows.
 ---
 
-MongoDB is mandatory before the bot starts and owns users, settings, admin permissions, custom countries, custom payment definitions, inventory, and auto prices. SQLite remains authoritative for deposits, UPI orders, orders, and balance mutations until their dedicated migration phases.
+MongoDB is mandatory before the bot starts and owns users, settings, admin permissions, custom countries, custom payment definitions, inventory, auto prices, balances, deposits, and UPI orders. SQLite remains authoritative for orders until their dedicated migration phase.
 
-**Why:** The migration is intentionally incremental; moving financial and order state before its consistency model is defined could split balances or create duplicate business events.
+**Why:** The migration is intentionally incremental; orders remain deferred while balance and payment state now use MongoDB's atomic event model to avoid duplicate financial effects.
 
-**How to apply:** Preserve the Mongo startup gate and keep future SQLite usage limited to the explicitly deferred collections. User creation must remain idempotent and must not reset existing fields. Inventory reservations must remain atomic in MongoDB.
+**How to apply:** Preserve the Mongo startup gate and keep future SQLite usage limited to orders. User creation must remain idempotent and must not reset existing fields. Inventory reservations and balance events must remain atomic in MongoDB.
 
 MongoDB's built-in `_id` index should be treated as verified during preparation and never passed to `create_index`; only application-defined indexes should be created.
 

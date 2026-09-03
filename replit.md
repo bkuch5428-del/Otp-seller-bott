@@ -13,8 +13,8 @@ as the Render background-worker start command.
 The bot keeps its existing SQLite database file, session files, and screenshots
 directories unchanged. MongoDB is required at startup and is used for users,
 settings, admin permissions, custom countries, custom payment definitions,
-inventory, and auto prices. Deposits, UPI orders, orders, and balance mutations
-remain on SQLite for now.
+inventory, auto prices, user balances, deposits, and UPI orders. Orders remain
+on SQLite for now.
 
 ## Required environment variable names
 

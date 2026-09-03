@@ -32,18 +32,36 @@ class FakeCollection:
                 continue
             actual = document.get(key)
             if isinstance(value, dict):
-                if "$ne" in value and actual == value["$ne"]:
-                    return False
+                if "$ne" in value:
+                    forbidden = value["$ne"]
+                    if (
+                        actual == forbidden
+                        or isinstance(actual, list)
+                        and forbidden in actual
+                    ):
+                        return False
                 if "$exists" in value and (key in document) != value["$exists"]:
                     return False
                 if "$in" in value and actual not in value["$in"]:
+                    return False
+                if "$nin" in value:
+                    forbidden = value["$nin"]
+                    if actual in forbidden or (
+                        isinstance(actual, list)
+                        and any(item in forbidden for item in actual)
+                    ):
+                        return False
+                if "$gte" in value and (actual is None or actual < value["$gte"]):
                     return False
                 if "$regex" in value:
                     options = re.IGNORECASE if "i" in value.get("$options", "") else 0
                     if not re.search(value["$regex"], str(actual or ""), options):
                         return False
                 continue
-            if actual != value:
+            if isinstance(actual, list):
+                if value not in actual:
+                    return False
+            elif actual != value:
                 return False
         return True
 
@@ -95,6 +113,10 @@ class FakeCollection:
             document.update(update.get("$set", {}))
             for key, amount in update.get("$inc", {}).items():
                 document[key] = document.get(key, 0) + amount
+            for key, value in update.get("$addToSet", {}).items():
+                current = document.setdefault(key, [])
+                if value not in current:
+                    current.append(value)
             for key, operation in update.get("$bit", {}).items():
                 if "xor" in operation:
                     document[key] = int(document.get(key, 0)) ^ int(operation["xor"])
@@ -432,6 +454,153 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertEqual(store.get_custom_payment("Test Pay")["_id"], payment_id)
         store.delete_custom_payment(payment_id)
         self.assertIsNone(store.get_custom_payment("Test Pay"))
+
+    def test_atomic_balance_deduction_and_insufficient_balance(self):
+        _database, store = self.make_store()
+        store.ensure_user(21)
+        store.set_user_fields(21, {"balance": 100})
+
+        self.assertTrue(store.deduct_balance(21, 70, "debit-one", "test_debit"))
+        self.assertFalse(store.deduct_balance(21, 31, "debit-two", "test_debit"))
+        self.assertEqual(store.get_balance(21), 30)
+
+    def test_concurrent_balance_deductions_have_only_affordable_winners(self):
+        _database, store = self.make_store()
+        store.ensure_user(22)
+        store.set_user_fields(22, {"balance": 100})
+        barrier = threading.Barrier(4)
+        results = []
+
+        def deduct(index):
+            barrier.wait()
+            results.append(
+                store.deduct_balance(
+                    22,
+                    30,
+                    f"concurrent-debit-{index}",
+                    "test_debit",
+                )
+            )
+
+        threads = [threading.Thread(target=deduct, args=(index,)) for index in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sum(results), 3)
+        self.assertEqual(store.get_balance(22), 10)
+
+    def test_atomic_balance_credit_is_idempotent_and_preserves_related_increment(self):
+        _database, store = self.make_store()
+        store.ensure_user(23)
+        first = store.credit_balance(
+            23,
+            50,
+            "deposit:10:approval",
+            "deposit_approval",
+            extra_inc={"total_deposited": 50},
+        )
+        second = store.credit_balance(
+            23,
+            50,
+            "deposit:10:approval",
+            "deposit_approval",
+            extra_inc={"total_deposited": 50},
+        )
+
+        self.assertTrue(first["applied"])
+        self.assertTrue(second["already_applied"])
+        self.assertEqual(store.get_balance(23), 50)
+        self.assertEqual(store.get_user(23)["total_deposited"], 50)
+        self.assertEqual(
+            store.balance_ledger.count_documents({"_id": "deposit:10:approval"}),
+            1,
+        )
+        with self.assertRaises(ValueError):
+            store.credit_balance(
+                23,
+                60,
+                "deposit:10:approval",
+                "deposit_approval",
+            )
+
+    def test_concurrent_duplicate_balance_credit_has_one_winner(self):
+        _database, store = self.make_store()
+        store.ensure_user(24)
+        barrier = threading.Barrier(5)
+        results = []
+
+        def credit():
+            barrier.wait()
+            results.append(
+                store.credit_balance(
+                    24,
+                    25,
+                    "refund:inventory:one",
+                    "refund",
+                )
+            )
+
+        threads = [threading.Thread(target=credit) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sum(result["applied"] for result in results), 1)
+        self.assertEqual(store.get_balance(24), 25)
+
+    def test_deposit_creation_allocates_numeric_ids_and_preserves_fields(self):
+        _database, store = self.make_store()
+        store.repository.initialize_counter("deposits", 40)
+        first = store.create_deposit(
+            25,
+            100,
+            "UPI",
+            date="2026-09-03 10:00:00",
+            screenshot="screenshots/a.jpg",
+            utr="UTR12345678",
+        )
+        second = store.create_deposit(25, 200, "Cwallet")
+
+        self.assertEqual(first["_id"], 41)
+        self.assertEqual(second["_id"], 42)
+        self.assertEqual(store.get_deposit(41)["utr"], "UTR12345678")
+        self.assertEqual(store.get_deposit(41)["status"], "pending")
+        self.assertEqual(store.get_deposit(42)["amount"], 200)
+
+    def test_deposit_approval_transition_and_credit_are_idempotent(self):
+        _database, store = self.make_store()
+        store.ensure_user(26)
+        deposit = store.create_deposit(26, 75, "UPI")
+
+        first = store.approve_deposit(deposit["_id"], 75)
+        second = store.approve_deposit(deposit["_id"], 75)
+
+        self.assertTrue(first["credited"])
+        self.assertFalse(second["credited"])
+        self.assertEqual(store.get_balance(26), 75)
+        self.assertEqual(store.get_user(26)["total_deposited"], 75)
+        self.assertEqual(store.get_deposit(deposit["_id"])["status"], "approved")
+
+    def test_deposit_rejection_transition_is_idempotent(self):
+        _database, store = self.make_store()
+        deposit = store.create_deposit(27, 80, "Manual")
+
+        self.assertTrue(store.transition_deposit(deposit["_id"], "pending", "rejected"))
+        self.assertFalse(store.transition_deposit(deposit["_id"], "pending", "rejected"))
+        self.assertEqual(store.get_deposit(deposit["_id"])["status"], "rejected")
+
+    def test_upi_order_creation_is_idempotent_and_conflict_safe(self):
+        _database, store = self.make_store()
+        first = store.create_upi_order("ORDER_28_1", 28, 125)
+        retry = store.create_upi_order("ORDER_28_1", 28, 125)
+
+        self.assertEqual(first, retry)
+        with self.assertRaises(ValueError):
+            store.create_upi_order("ORDER_28_1", 29, 125)
+        self.assertEqual(store.upi_orders.count_documents({}), 1)
 
     def make_store(self):
         database = FakeDatabase()

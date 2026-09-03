@@ -7,10 +7,9 @@ It provides:
 * safe collection/index preparation;
 * conflict-aware document comparison;
 * a non-destructive counter initializer; and
-* runtime helpers for the selected user/settings/admin/custom-definition cutover.
+* runtime helpers for the Mongo-backed users, payments, inventory, and prices.
 
-Deposits, orders, and balance mutations remain SQLite-backed until their
-dedicated migration phases.
+Orders remain SQLite-backed until their dedicated migration phase.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -155,10 +155,23 @@ COLLECTION_DEFINITIONS = {
         required_fields=("_id", "code", "name", "flag"),
         identity_fields=("_id",),
     ),
-    # These collections have no SQLite source rows in this phase. They are
-    # prepared for later idempotent balance/workflow persistence.
+    # These collections have no SQLite source rows. They support runtime
+    # counters, idempotent balance events, and pending workflows.
     "counters": CollectionDefinition("counters", managed_fields=("_id", "value")),
-    "balance_ledger": CollectionDefinition("balance_ledger"),
+    "balance_ledger": CollectionDefinition(
+        "balance_ledger",
+        managed_fields=(
+            "_id",
+            "user_id",
+            "delta",
+            "extra_inc",
+            "event_type",
+            "status",
+            "created_at",
+        ),
+        required_fields=("_id", "user_id", "delta", "status"),
+        identity_fields=("_id",),
+    ),
     "pending_workflows": CollectionDefinition("pending_workflows"),
 }
 
@@ -220,7 +233,9 @@ INDEX_DEFINITIONS = {
         IndexDefinition("custom_countries_name", (("name", 1),)),
     ),
     "counters": (),
-    "balance_ledger": (),
+    "balance_ledger": (
+        IndexDefinition("balance_ledger_user", (("user_id", 1),)),
+    ),
     "pending_workflows": (),
 }
 
@@ -599,8 +614,8 @@ class MongoRuntimeStore:
     """Runtime accessors for the Mongo-backed portions of the bot.
 
     Inventory reservations use MongoDB's atomic ``find_one_and_update``.
-    Deposits, orders, and balance mutations remain in SQLite until their
-    dedicated migration phases.
+    Balance events use an atomic user update guarded by a unique ledger event
+    key. Orders remain in SQLite until their dedicated migration phase.
     """
 
     ADMIN_PERMISSIONS = {
@@ -882,6 +897,326 @@ class MongoRuntimeStore:
             if self.set_inventory_available(phone, 1):
                 released += 1
         return released
+
+    @property
+    def deposits(self) -> Any:
+        return self.repository.collection("deposits")
+
+    @property
+    def upi_orders(self) -> Any:
+        return self.repository.collection("upi_orders")
+
+    @property
+    def balance_ledger(self) -> Any:
+        return self.repository.collection("balance_ledger")
+
+    def get_balance(self, user_id: int) -> int:
+        document = self.users.find_one({"_id": int(user_id)}, {"balance": 1})
+        return int(document.get("balance", 0) or 0) if document else 0
+
+    def apply_balance_event(
+        self,
+        user_id: int,
+        delta: int,
+        event_key: str,
+        event_type: str,
+        extra_inc: Mapping[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Apply one idempotent balance delta and any related user increments.
+
+        ``balance_event_keys`` is updated in the same atomic user operation as
+        ``balance``. The ledger document is intentionally inserted first with
+        ``$setOnInsert`` so retries can recover from an interrupted attempt
+        without overwriting an existing event's details.
+        """
+        user_id = int(user_id)
+        delta = int(delta)
+        event_key = str(event_key)
+        if delta == 0:
+            raise ValueError("balance event delta must not be zero")
+        if not event_key:
+            raise ValueError("balance event key must not be empty")
+
+        increments = {
+            str(field): int(value)
+            for field, value in (extra_inc or {}).items()
+        }
+        allowed_extra_fields = {"total_deposited"}
+        if set(increments) - allowed_extra_fields:
+            raise ValueError("unsupported balance event field")
+
+        existing_ledger = self.balance_ledger.find_one({"_id": event_key})
+        ledger_identity = {
+            "user_id": user_id,
+            "delta": delta,
+            "extra_inc": increments,
+            "event_type": str(event_type),
+        }
+        if existing_ledger and any(
+            existing_ledger.get(field) != value
+            for field, value in ledger_identity.items()
+        ):
+            raise ValueError(f"Conflicting balance event key: {event_key}")
+
+        ledger_insert = {
+            "_id": event_key,
+            "user_id": user_id,
+            "delta": delta,
+            "extra_inc": increments,
+            "event_type": str(event_type),
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            self.balance_ledger.update_one(
+                {"_id": event_key},
+                {"$setOnInsert": ledger_insert},
+                upsert=True,
+            )
+        except Exception:
+            # Concurrent upserts can race on the unique _id. Re-read before
+            # treating the error as a duplicate; real storage errors surface.
+            if not self.balance_ledger.find_one({"_id": event_key}):
+                raise
+        stored_ledger = self.balance_ledger.find_one({"_id": event_key})
+        if stored_ledger and any(
+            stored_ledger.get(field) != value
+            for field, value in ledger_identity.items()
+        ):
+            raise ValueError(f"Conflicting balance event key: {event_key}")
+
+        filters: dict[str, Any] = {
+            "_id": user_id,
+            "balance_event_keys": {"$ne": event_key},
+        }
+        if delta < 0:
+            filters["balance"] = {"$gte": -delta}
+        update_inc = {"balance": delta, **increments}
+        result = self.users.update_one(
+            filters,
+            {
+                "$inc": update_inc,
+                "$addToSet": {"balance_event_keys": event_key},
+            },
+        )
+        if not getattr(result, "matched_count", 0):
+            existing = self.users.find_one(
+                {"_id": user_id, "balance_event_keys": event_key},
+                {"balance": 1},
+            )
+            if existing:
+                self.balance_ledger.update_one(
+                    {"_id": event_key},
+                    {"$set": {"status": "applied"}},
+                )
+                return {
+                    "applied": False,
+                    "already_applied": True,
+                    "balance": int(existing.get("balance", 0) or 0),
+                }
+            return {
+                "applied": False,
+                "already_applied": False,
+                "insufficient": delta < 0,
+            }
+
+        self.balance_ledger.update_one(
+            {"_id": event_key},
+            {"$set": {"status": "applied"}},
+        )
+        updated = self.users.find_one({"_id": user_id}, {"balance": 1})
+        return {
+            "applied": True,
+            "already_applied": False,
+            "balance": int(updated.get("balance", 0) or 0) if updated else None,
+        }
+
+    def deduct_balance(
+        self,
+        user_id: int,
+        amount: int,
+        event_key: str | None = None,
+        event_type: str = "balance_debit",
+    ) -> bool:
+        """Atomically deduct funds, optionally making the debit idempotent."""
+        amount = int(amount)
+        if amount <= 0:
+            raise ValueError("balance deduction amount must be positive")
+        if event_key is None:
+            result = self.users.update_one(
+                {"_id": int(user_id), "balance": {"$gte": amount}},
+                {"$inc": {"balance": -amount}},
+            )
+            return bool(getattr(result, "matched_count", 0))
+        result = self.apply_balance_event(
+            user_id,
+            -amount,
+            event_key,
+            event_type,
+        )
+        return bool(result.get("applied") or result.get("already_applied"))
+
+    def credit_balance(
+        self,
+        user_id: int,
+        amount: int,
+        event_key: str,
+        event_type: str,
+        extra_inc: Mapping[str, int] | None = None,
+    ) -> dict[str, Any]:
+        amount = int(amount)
+        if amount <= 0:
+            raise ValueError("balance credit amount must be positive")
+        return self.apply_balance_event(
+            user_id,
+            amount,
+            event_key,
+            event_type,
+            extra_inc=extra_inc,
+        )
+
+    def create_deposit(
+        self,
+        user_id: int,
+        amount: int,
+        method_name: str,
+        status: str = "pending",
+        date: str | None = None,
+        screenshot: str | None = None,
+        utr: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create a deposit using the Mongo-backed numeric counter."""
+        for _ in range(100):
+            document: dict[str, Any] = {
+                "_id": self.repository.allocate_counter("deposits"),
+                "user_id": int(user_id),
+                "amount": int(amount),
+                "method_name": str(method_name),
+                "status": str(status),
+                "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "screenshot": screenshot,
+                "utr": utr,
+            }
+            if not self.deposits.find_one({"_id": document["_id"]}):
+                break
+        else:
+            raise RuntimeError("Unable to allocate a free deposit ID")
+        self.deposits.insert_one(document)
+        return document
+
+    def get_deposit(self, deposit_id: Any) -> Mapping[str, Any] | None:
+        return self.deposits.find_one({"_id": int(deposit_id)})
+
+    def transition_deposit(
+        self,
+        deposit_id: Any,
+        from_status: str,
+        to_status: str,
+        amount: int | None = None,
+    ) -> bool:
+        fields: dict[str, Any] = {"status": str(to_status)}
+        if amount is not None:
+            fields["amount"] = int(amount)
+        result = self.deposits.update_one(
+            {"_id": int(deposit_id), "status": str(from_status)},
+            {"$set": fields},
+        )
+        return bool(getattr(result, "matched_count", 0))
+
+    def approve_deposit(self, deposit_id: Any, amount: int) -> dict[str, Any]:
+        """Approve a deposit and apply its balance event exactly once."""
+        deposit_id = int(deposit_id)
+        amount = int(amount)
+        deposit = self.get_deposit(deposit_id)
+        if not deposit:
+            return {"status": "missing"}
+
+        user_id = int(deposit["user_id"])
+        if deposit.get("status") == "pending":
+            self.ensure_user(user_id)
+            transitioned = self.transition_deposit(
+                deposit_id,
+                "pending",
+                "approved",
+                amount=amount,
+            )
+            deposit = self.get_deposit(deposit_id)
+            if not transitioned and (
+                not deposit or deposit.get("status") != "approved"
+            ):
+                return {"status": "processed"}
+        elif deposit.get("status") != "approved":
+            return {"status": "processed"}
+
+        previous_balance = self.get_balance(user_id)
+        result = self.credit_balance(
+            user_id,
+            int(deposit["amount"]),
+            f"deposit:{deposit_id}:approval",
+            "deposit_approval",
+            extra_inc={"total_deposited": int(deposit["amount"])},
+        )
+        if not result.get("applied") and not result.get("already_applied"):
+            raise RuntimeError(f"Could not credit approved deposit {deposit_id}")
+        return {
+            "status": "approved",
+            "credited": bool(result.get("applied")),
+            "user_id": user_id,
+            "amount": int(deposit["amount"]),
+            "previous_balance": previous_balance,
+            "new_balance": result.get("balance", previous_balance),
+        }
+
+    def create_upi_order(
+        self,
+        order_id: str,
+        user_id: int,
+        amount: int,
+        status: str = "pending",
+        date: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Insert a UPI order without overwriting a conflicting order ID."""
+        order_id = str(order_id)
+        document = {
+            "_id": order_id,
+            "order_id": order_id,
+            "user_id": int(user_id),
+            "amount": int(amount),
+            "status": str(status),
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        existing = self.upi_orders.find_one({"_id": order_id})
+        if existing:
+            identity = {
+                key: existing.get(key)
+                for key in ("order_id", "user_id", "amount")
+            }
+            if identity == {
+                key: document[key]
+                for key in ("order_id", "user_id", "amount")
+            }:
+                return existing
+            raise ValueError(f"Conflicting UPI order ID: {order_id}")
+        try:
+            self.upi_orders.insert_one(document)
+        except Exception:
+            existing = self.upi_orders.find_one({"_id": order_id})
+            if not existing:
+                raise
+            identity = {
+                key: existing.get(key)
+                for key in ("order_id", "user_id", "amount")
+            }
+            if identity == {
+                key: document[key]
+                for key in ("order_id", "user_id", "amount")
+            }:
+                return existing
+            raise ValueError(f"Conflicting UPI order ID: {order_id}")
+        return document
+
+    def get_upi_order(self, order_id: str) -> Mapping[str, Any] | None:
+        return self.upi_orders.find_one({"_id": str(order_id)})
 
     def get_auto_price(self, country: str, year: Any) -> int | None:
         document = self.auto_prices.find_one(
