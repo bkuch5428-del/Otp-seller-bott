@@ -655,12 +655,12 @@ def update_balance(uid, amount, event_key, event_type="balance_adjustment", extr
         extra_inc=extra_inc,
     )
 
-def rollback_single_purchase(uid, phone, amount, *, remove_inventory):
+def rollback_single_purchase(uid, phone, amount, purchase_id, *, remove_inventory):
     """Refund a charged single purchase before making its stock reusable/removing it."""
     refund = update_balance(
         uid,
         amount,
-        f"purchase:single:{phone}:refund",
+        f"purchase:single:{purchase_id}:refund",
         "purchase_refund",
     )
     if not refund.get("applied") and not refund.get("already_applied"):
@@ -1434,9 +1434,15 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
 
 async def process_purchase(event, country, year_str, price_str, category=None, dc=None):
     message = getattr(event, "message", None)
-    message_id = getattr(message, "id", None)
+    message_id = getattr(message, "id", None) or getattr(event, "id", None)
+    chat_id = getattr(event, "chat_id", None)
     attempt_key = (
-        (event.sender_id, getattr(event, "chat_id", None), message_id)
+        (event.sender_id, chat_id, message_id)
+        if message_id is not None
+        else None
+    )
+    purchase_id = (
+        f"{event.sender_id}:{chat_id}:{message_id}"
         if message_id is not None
         else None
     )
@@ -1446,7 +1452,7 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             return
         if not mongo_store.claim_purchase_callback(
             event.sender_id,
-            getattr(event, "chat_id", None),
+            chat_id,
             message_id,
         ):
             logger.info("Ignoring Mongo-claimed purchase callback key=%r", attempt_key)
@@ -1454,7 +1460,9 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             return
         purchase_attempts[attempt_key] = "processing"
     try:
-        result = await _process_purchase(event, country, year_str, price_str, category, dc)
+        result = await _process_purchase(
+            event, country, year_str, price_str, category, dc, purchase_id
+        )
         if attempt_key is not None:
             purchase_attempts[attempt_key] = "completed"
         return result
@@ -1473,7 +1481,9 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
         raise
 
 
-async def _process_purchase(event, country, year_str, price_str, category=None, dc=None):
+async def _process_purchase(
+    event, country, year_str, price_str, category=None, dc=None, purchase_id=None
+):
     uid, base_price = event.sender_id, int(price_str)
 
     discount = get_user_discount(uid)
@@ -1509,7 +1519,7 @@ async def _process_purchase(event, country, year_str, price_str, category=None, 
             debited = mongo_store.deduct_balance(
                 uid,
                 final_price,
-                event_key=f"purchase:single:{phone}:debit",
+                event_key=f"purchase:single:{purchase_id}:debit",
                 event_type="purchase_debit",
             )
             if not debited:
@@ -1525,7 +1535,9 @@ async def _process_purchase(event, country, year_str, price_str, category=None, 
         client = TelegramClient(clean_sess, API_ID, API_HASH)
     except Exception:
         async with get_user_lock(uid):
-            rollback_single_purchase(uid, phone, final_price, remove_inventory=False)
+            rollback_single_purchase(
+                uid, phone, final_price, purchase_id, remove_inventory=False
+            )
         raise
     
     try:
@@ -1538,7 +1550,9 @@ async def _process_purchase(event, country, year_str, price_str, category=None, 
             phone,
         )
         async with get_user_lock(uid):
-            rollback_single_purchase(uid, phone, final_price, remove_inventory=True)
+            rollback_single_purchase(
+                uid, phone, final_price, purchase_id, remove_inventory=True
+            )
         try:
             await client.disconnect()
         except Exception:
@@ -1561,7 +1575,8 @@ async def _process_purchase(event, country, year_str, price_str, category=None, 
         'uid': uid,
         'client': client, 'sess': sess, 'start_time': time.time(), 
         'paid': False, 'price': final_price, 'country': country, 'year': actual_year, 
-        'c_icon': c_icon, 'twofa': twofa_pass, 'msg_id': sent_msg.id
+        'c_icon': c_icon, 'twofa': twofa_pass, 'msg_id': sent_msg.id,
+        'purchase_id': purchase_id,
     }
     asyncio.create_task(auto_otp_task(phone))
 
@@ -1595,7 +1610,7 @@ async def auto_otp_task(phone):
                             order['price'],
                             phone,
                             code,
-                            purchase_key=f"purchase:single:{phone}",
+                            purchase_key=f"purchase:single:{order['purchase_id']}",
                         )
                         order['paid'] = True
                         mongo_store.delete_inventory(phone)
@@ -1627,7 +1642,7 @@ async def auto_otp_task(phone):
             update_balance(
                 uid,
                 order["price"],
-                f"purchase:single:{phone}:timeout_refund",
+                f"purchase:single:{order['purchase_id']}:timeout_refund",
                 "timeout_refund",
             )
         mongo_store.set_inventory_available(phone, 1)

@@ -689,7 +689,7 @@ class MongoPersistenceTests(unittest.TestCase):
             reserved = store.reserve_inventory_item("India", 2024, 100, "Good")
             self.assertIsNotNone(reserved)
             phone = reserved["phone"]
-            purchase_key = f"purchase:single:{phone}"
+            purchase_key = "purchase:single:31:99:601"
             self.assertTrue(
                 store.deduct_balance(
                     31,
@@ -714,6 +714,46 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertEqual(store.get_balance(31), 0)
         self.assertEqual(store.orders.count_documents({}), 1)
         self.assertEqual(store.count_inventory({"available": 0}), 1)
+
+    def test_separate_single_purchases_have_distinct_debit_events(self):
+        _database, store = self.make_store()
+        store.ensure_user(32)
+        store.set_user_fields(32, {"balance": 200})
+        store.save_inventory(self.inventory_document("9199990010"))
+        store.save_inventory(self.inventory_document("9199990011"))
+
+        first = store.reserve_inventory_item("India", 2024, 100, "Good")
+        second = store.reserve_inventory_item("India", 2024, 100, "Good")
+        self.assertNotEqual(first["phone"], second["phone"])
+
+        self.assertTrue(
+            store.deduct_balance(32, 100, "purchase:single:32:99:701:debit", "purchase_debit")
+        )
+        self.assertTrue(
+            store.deduct_balance(32, 100, "purchase:single:32:99:702:debit", "purchase_debit")
+        )
+        self.assertEqual(store.get_balance(32), 0)
+        self.assertEqual(store.balance_ledger.count_documents({"user_id": 32}), 2)
+
+    def test_released_stock_can_be_purchased_with_a_new_event_key(self):
+        _database, store = self.make_store()
+        store.ensure_user(33)
+        store.set_user_fields(33, {"balance": 100})
+        store.save_inventory(self.inventory_document("9199990012"))
+
+        reserved = store.reserve_inventory_item("India", 2024, 100, "Good")
+        self.assertTrue(
+            store.deduct_balance(33, 100, "purchase:single:33:99:801:debit", "purchase_debit")
+        )
+        store.credit_balance(33, 100, "purchase:single:33:99:801:refund", "purchase_refund")
+        store.release_inventory([reserved["phone"]])
+
+        replacement = store.reserve_inventory_item("India", 2024, 100, "Good")
+        self.assertEqual(replacement["phone"], reserved["phone"])
+        self.assertTrue(
+            store.deduct_balance(33, 100, "purchase:single:33:99:802:debit", "purchase_debit")
+        )
+        self.assertEqual(store.get_balance(33), 0)
 
     def make_store(self):
         database = FakeDatabase()
