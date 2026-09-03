@@ -289,6 +289,7 @@ custom_dep_amt = {}
 pending_utr = {}        
 broadcast_drafts = {}
 broadcast_jobs = {}
+purchase_attempts = {}
 
 user_locks = {}
 
@@ -653,6 +654,21 @@ def update_balance(uid, amount, event_key, event_type="balance_adjustment", extr
         event_type,
         extra_inc=extra_inc,
     )
+
+def rollback_single_purchase(uid, phone, amount, *, remove_inventory):
+    """Refund a charged single purchase before making its stock reusable/removing it."""
+    refund = update_balance(
+        uid,
+        amount,
+        f"purchase:single:{phone}:refund",
+        "purchase_refund",
+    )
+    if not refund.get("applied") and not refund.get("already_applied"):
+        raise RuntimeError(f"Could not refund single purchase for {phone}")
+    if remove_inventory:
+        mongo_store.delete_inventory(phone)
+    else:
+        mongo_store.release_inventory([phone])
 
 def delete_session_files(session_path):
     base = session_path if not session_path.endswith('.session') else session_path[:-8]
@@ -1417,17 +1433,68 @@ async def confirm_purchase(event, country, year, price_str, category=None, dc=No
     await event.edit(msg, buttons=btns)
 
 async def process_purchase(event, country, year_str, price_str, category=None, dc=None):
+    message = getattr(event, "message", None)
+    message_id = getattr(message, "id", None)
+    attempt_key = (
+        (event.sender_id, getattr(event, "chat_id", None), message_id)
+        if message_id is not None
+        else None
+    )
+    if attempt_key is not None:
+        if attempt_key in purchase_attempts:
+            logger.info("Ignoring repeated purchase callback key=%r", attempt_key)
+            return
+        if not mongo_store.claim_purchase_callback(
+            event.sender_id,
+            getattr(event, "chat_id", None),
+            message_id,
+        ):
+            logger.info("Ignoring Mongo-claimed purchase callback key=%r", attempt_key)
+            purchase_attempts[attempt_key] = "completed"
+            return
+        purchase_attempts[attempt_key] = "processing"
+    try:
+        result = await _process_purchase(event, country, year_str, price_str, category, dc)
+        if attempt_key is not None:
+            purchase_attempts[attempt_key] = "completed"
+        return result
+    except Exception:
+        if attempt_key is not None:
+            purchase_attempts[attempt_key] = "failed"
+        logger.exception(
+            "process_purchase failed uid=%s country=%r year=%r price=%r category=%r dc=%r",
+            getattr(event, "sender_id", None),
+            country,
+            year_str,
+            price_str,
+            category,
+            dc,
+        )
+        raise
+
+
+async def _process_purchase(event, country, year_str, price_str, category=None, dc=None):
     uid, base_price = event.sender_id, int(price_str)
 
     discount = get_user_discount(uid)
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
+    category_was_omitted = (
+        category is None or str(category).strip().lower() in {"", "none", "null"}
+    )
+    dc_was_omitted = dc is None or str(dc).strip().lower() in {"", "none", "null"}
     category = (category or "Standard").strip() or "Standard"
-    dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
+    dc = None if dc_was_omitted else str(dc)
 
     async with get_user_lock(uid):
         reserved = mongo_store.reserve_inventory_item(
-            country, year_str, base_price, category, dc
+            country,
+            year_str,
+            base_price,
+            category,
+            dc,
+            match_any_category=category_was_omitted,
+            match_any_dc=dc_was_omitted,
         )
         if not reserved:
             return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
@@ -1452,23 +1519,30 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
             mongo_store.release_inventory([phone])
             raise
 
-    await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
-    clean_sess = sess if not sess.endswith(".session") else sess[:-8]
-    client = TelegramClient(clean_sess, API_ID, API_HASH)
+    try:
+        await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
+        clean_sess = sess if not sess.endswith(".session") else sess[:-8]
+        client = TelegramClient(clean_sess, API_ID, API_HASH)
+    except Exception:
+        async with get_user_lock(uid):
+            rollback_single_purchase(uid, phone, final_price, remove_inventory=False)
+        raise
     
     try:
         await client.connect()
         if not await client.is_user_authorized(): raise Exception("Session dead")
     except Exception:
+        logger.exception(
+            "process_purchase session validation failed uid=%s phone=%s",
+            uid,
+            phone,
+        )
         async with get_user_lock(uid):
-            mongo_store.delete_inventory(phone)
-            update_balance(
-                uid,
-                final_price,
-                f"purchase:single:{phone}:refund",
-                "purchase_refund",
-            )
-        await client.disconnect()
+            rollback_single_purchase(uid, phone, final_price, remove_inventory=True)
+        try:
+            await client.disconnect()
+        except Exception:
+            logger.exception("process_purchase disconnect failed uid=%s phone=%s", uid, phone)
         delete_session_files(sess)
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
 
@@ -1513,11 +1587,18 @@ async def auto_otp_task(phone):
             
             if code:
                 if not order['paid']:
-                    order['paid'] = True
                     async with get_user_lock(uid):
-                        cur.execute("INSERT INTO orders (user_id, country, year, price, phone, otp) VALUES (?,?,?,?,?,?)", (uid, order['country'], order['year'], order['price'], phone, code))
-                        db.commit()
-                    mongo_store.delete_inventory(phone)
+                        mongo_store.create_order(
+                            uid,
+                            order['country'],
+                            order['year'],
+                            order['price'],
+                            phone,
+                            code,
+                            purchase_key=f"purchase:single:{phone}",
+                        )
+                        order['paid'] = True
+                        mongo_store.delete_inventory(phone)
                     
                     await log_primary_purchase(uid, order['country'], order['price'], order['price'], order['year'], 1)
                 
@@ -1610,11 +1691,24 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
                 return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
 
             price_per_acc = final_cost // qty
+            created_order_ids = []
             for p in phones:
-                cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
-            db.commit()
+                purchase_key = f"purchase:bulk:{p}"
+                existing_order = mongo_store.orders.find_one({"purchase_key": purchase_key})
+                order_document = mongo_store.create_order(
+                    uid,
+                    country,
+                    year,
+                    price_per_acc,
+                    p,
+                    "SESSION_FILES",
+                    purchase_key=purchase_key,
+                )
+                if existing_order is None:
+                    created_order_ids.append(order_document["_id"])
         except Exception:
-            db.rollback()
+            for order_id in locals().get("created_order_ids", []):
+                mongo_store.delete_order(order_id)
             mongo_store.release_inventory(item["phone"] for item in reserved)
             if "purchase_key" in locals():
                 update_balance(
@@ -1686,9 +1780,9 @@ async def stats_handler(event, is_callback=False):
     user = mongo_store.get_user(uid, {"total_deposited": 1})
     if not user: return
     dep = user.get("total_deposited", 0) or 0
-    o_row = cur.execute("SELECT COUNT(*), SUM(price) FROM orders WHERE user_id=?", (uid,)).fetchone()
-    total_orders = o_row[0] if o_row else 0
-    spent = o_row[1] if o_row and o_row[1] else 0
+    user_orders = list(mongo_store.orders.find({"user_id": int(uid)}))
+    total_orders = len(user_orders)
+    spent = sum(int(order.get("price", 0) or 0) for order in user_orders)
     ref_count = mongo_store.count_referrals(uid)
     
     msg = (f"{PE_CROWN} <b>My Statistics</b>\n\n"
@@ -1706,9 +1800,16 @@ async def stats_handler(event, is_callback=False):
 async def send_purchase_page(event, uid, page):
     limit = 5
     offset = (page - 1) * limit
-    t_row = cur.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (uid,)).fetchone()
-    total = t_row[0] if t_row else 0
-    rows = cur.execute("SELECT phone, date FROM orders WHERE user_id=? ORDER BY id DESC LIMIT ? OFFSET ?", (uid, limit, offset)).fetchall()
+    user_orders = sorted(
+        mongo_store.orders.find({"user_id": int(uid)}),
+        key=lambda order: int(order.get("_id", 0)),
+        reverse=True,
+    )
+    total = len(user_orders)
+    rows = [
+        (order.get("phone"), order.get("date"))
+        for order in user_orders[offset:offset + limit]
+    ]
     
     msg = f"{PE_FLOWER} <b>Purchase History</b>\nPage {page}\n\n"
     if not rows: msg += "No purchases found."
@@ -1856,13 +1957,21 @@ async def render_admin_stats(event, period="all"):
     total_deposits = mongo_store.sum_user_field("total_deposited")
     period_deposit_count, period_deposits = deposit_row
 
-    order_row = cur.execute(
-        "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE 1=1" + date_filter
-    ).fetchone()
-    period_orders, period_sales = order_row
-    total_orders, total_sales = cur.execute(
-        "SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders"
-    ).fetchone()
+    all_orders = list(mongo_store.orders.find({}))
+    period_order_documents = (
+        all_orders
+        if period == "all"
+        else [
+            order for order in all_orders
+            if str(order.get("date") or "") >= since
+        ]
+    )
+    period_orders = len(period_order_documents)
+    period_sales = sum(
+        int(order.get("price", 0) or 0) for order in period_order_documents
+    )
+    total_orders = len(all_orders)
+    total_sales = sum(int(order.get("price", 0) or 0) for order in all_orders)
 
     total_referrals = mongo_store.count_referrals()
     period_referrals = (
@@ -1940,7 +2049,7 @@ async def render_user_management(event, target_id):
     except Exception:
         pass
 
-    order_row = cur.execute("SELECT COUNT(*), COALESCE(SUM(price), 0) FROM orders WHERE user_id=?", (user_id,)).fetchone()
+    user_orders = list(mongo_store.orders.find({"user_id": user_id}))
     approved_deposits = list(
         mongo_store.deposits.find({"user_id": user_id, "status": "approved"})
     )
@@ -1949,7 +2058,8 @@ async def render_user_management(event, target_id):
         sum(int(document.get("amount", 0) or 0) for document in approved_deposits),
     )
     referral_count = mongo_store.count_referrals(user_id)
-    order_count, spent = order_row
+    order_count = len(user_orders)
+    spent = sum(int(order.get("price", 0) or 0) for order in user_orders)
     approved_count, approved_total = deposit_row
 
     msg = (f"{P_ACC} <b>USER MANAGEMENT</b>\n\n"
@@ -3298,10 +3408,22 @@ async def handle_callback_query(e):
             else: await init_session_purchase(e, p[2], p[3], p[4])
             
         elif data.startswith("buy_cf|"):
-            p = data.split("|")
-            category = p[4] if len(p) > 4 else None
-            dc = p[5] if len(p) > 5 else None
-            await process_purchase(e, p[1], p[2], p[3], category, dc)
+            try:
+                # Acknowledge immediately so Telegram does not leave the
+                # button showing a spinner during Mongo/session work.
+                await e.answer()
+                p = data.split("|")
+                if len(p) < 4 or len(p) > 6 or not p[1] or not p[2] or not p[3]:
+                    raise ValueError(f"Invalid buy callback payload: {data!r}")
+                category = p[4] if len(p) > 4 else None
+                dc = p[5] if len(p) > 5 else None
+                await process_purchase(e, p[1], p[2], p[3], category, dc)
+            except Exception:
+                logger.exception("buy_cf callback failed uid=%s data=%r", uid, data)
+                try:
+                    await e.edit(f"{P_WARN} Purchase could not be completed. Please try again.")
+                except Exception:
+                    logger.exception("Unable to show buy_cf failure uid=%s data=%r", uid, data)
 
         elif data.startswith("get_otp_again|"):
             phone = data.split("|")[1]

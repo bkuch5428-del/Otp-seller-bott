@@ -602,6 +602,62 @@ class MongoPersistenceTests(unittest.TestCase):
             store.create_upi_order("ORDER_28_1", 29, 125)
         self.assertEqual(store.upi_orders.count_documents({}), 1)
 
+    def test_single_purchase_reservation_can_match_legacy_category_and_dc(self):
+        _database, store = self.make_store()
+        store.save_inventory(self.inventory_document("9199990006", category="Good", dc="dc1"))
+
+        reserved = store.reserve_inventory_item(
+            "India",
+            2024,
+            100,
+            "Standard",
+            None,
+            match_any_category=True,
+            match_any_dc=True,
+        )
+
+        self.assertEqual(reserved["phone"], "9199990006")
+        self.assertEqual(store.count_inventory({"available": 1}), 0)
+
+    def test_runtime_order_creation_preserves_numeric_ids_and_is_retry_safe(self):
+        _database, store = self.make_store()
+        store.repository.initialize_counter("orders", 40)
+
+        first = store.create_order(
+            29,
+            "India",
+            2024,
+            100,
+            "9199990007",
+            "12345",
+            purchase_key="purchase:single:9199990007",
+            date="2026-09-03 10:00:00",
+        )
+        retry = store.create_order(
+            29,
+            "India",
+            2024,
+            100,
+            "9199990007",
+            "12345",
+            purchase_key="purchase:single:9199990007",
+        )
+
+        self.assertEqual(first["_id"], 41)
+        self.assertEqual(retry["_id"], 41)
+        self.assertEqual(store.orders.count_documents({}), 1)
+        self.assertEqual(store.create_order(
+            29, "India", 2024, 100, "9199990008", "SESSION_FILES"
+        )["_id"], 42)
+
+    def test_purchase_callback_claim_is_idempotent(self):
+        _database, store = self.make_store()
+
+        self.assertTrue(store.claim_purchase_callback(30, 99, 501))
+        self.assertFalse(store.claim_purchase_callback(30, 99, 501))
+        self.assertTrue(store.claim_purchase_callback(30, 99, 502))
+        self.assertEqual(store.pending_workflows.count_documents({}), 2)
+
     def make_store(self):
         database = FakeDatabase()
         repository = MongoRepository(database)

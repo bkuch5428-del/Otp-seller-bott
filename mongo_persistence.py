@@ -852,6 +852,9 @@ class MongoRuntimeStore:
         price: Any,
         category: str | None = None,
         dc: Any = None,
+        *,
+        match_any_category: bool = False,
+        match_any_dc: bool = False,
     ) -> Mapping[str, Any] | None:
         """Atomically mark and return one matching available inventory item."""
         filters = self.inventory_filter(
@@ -862,6 +865,10 @@ class MongoRuntimeStore:
             dc=dc,
             available=1,
         )
+        if match_any_category:
+            filters.pop("category", None)
+        if match_any_dc:
+            filters.pop("data_center", None)
         return self.inventory.find_one_and_update(
             filters,
             {"$set": {"available": 0}},
@@ -905,6 +912,14 @@ class MongoRuntimeStore:
     @property
     def upi_orders(self) -> Any:
         return self.repository.collection("upi_orders")
+
+    @property
+    def orders(self) -> Any:
+        return self.repository.collection("orders")
+
+    @property
+    def pending_workflows(self) -> Any:
+        return self.repository.collection("pending_workflows")
 
     @property
     def balance_ledger(self) -> Any:
@@ -1217,6 +1232,104 @@ class MongoRuntimeStore:
 
     def get_upi_order(self, order_id: str) -> Mapping[str, Any] | None:
         return self.upi_orders.find_one({"_id": str(order_id)})
+
+    def delete_order(self, order_id: Any) -> int:
+        result = self.orders.delete_one({"_id": int(order_id)})
+        return int(getattr(result, "deleted_count", 0))
+
+    def claim_purchase_callback(
+        self,
+        user_id: int,
+        chat_id: Any,
+        message_id: Any,
+    ) -> bool:
+        """Claim one Telegram purchase callback exactly once in MongoDB."""
+        callback_key = f"purchase_callback:{int(user_id)}:{chat_id}:{int(message_id)}"
+        result = self.pending_workflows.update_one(
+            {"_id": callback_key},
+            {
+                "$setOnInsert": {
+                    "_id": callback_key,
+                    "type": "single_purchase",
+                    "user_id": int(user_id),
+                    "chat_id": chat_id,
+                    "message_id": int(message_id),
+                    "status": "processing",
+                    "created_at": datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                }
+            },
+            upsert=True,
+        )
+        return bool(getattr(result, "upserted_id", None) is not None)
+
+    def create_order(
+        self,
+        user_id: int,
+        country: str,
+        year: Any,
+        price: int,
+        phone: Any,
+        otp: str,
+        *,
+        purchase_key: str | None = None,
+        date: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Create an order with a preserved numeric counter and retry safety."""
+        user_id = int(user_id)
+        price = int(price)
+        phone = str(phone)
+        purchase_key = str(purchase_key) if purchase_key else None
+
+        if purchase_key:
+            existing = self.orders.find_one({"purchase_key": purchase_key})
+            if existing:
+                identity = {
+                    "user_id": int(existing.get("user_id")),
+                    "country": existing.get("country"),
+                    "year": existing.get("year"),
+                    "price": int(existing.get("price") or 0),
+                    "phone": str(existing.get("phone")),
+                    "otp": existing.get("otp"),
+                }
+                requested = {
+                    "user_id": user_id,
+                    "country": str(country),
+                    "year": year,
+                    "price": price,
+                    "phone": phone,
+                    "otp": otp,
+                }
+                if identity == requested:
+                    return existing
+                raise ValueError(f"Conflicting order purchase key: {purchase_key}")
+
+        document = {
+            "user_id": user_id,
+            "country": str(country),
+            "year": year,
+            "price": price,
+            "phone": phone,
+            "otp": str(otp),
+            "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if purchase_key:
+            document["purchase_key"] = purchase_key
+
+        for _ in range(100):
+            document["_id"] = self.repository.allocate_counter("orders")
+            if self.orders.find_one({"_id": document["_id"]}):
+                continue
+            try:
+                self.orders.insert_one(document)
+            except Exception:
+                existing = self.orders.find_one({"_id": document["_id"]})
+                if not existing:
+                    raise
+                continue
+            return document
+        raise RuntimeError("Unable to allocate a free order ID")
 
     def get_auto_price(self, country: str, year: Any) -> int | None:
         document = self.auto_prices.find_one(
