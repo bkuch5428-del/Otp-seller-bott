@@ -262,161 +262,6 @@ def initialize_mongo_runtime():
         raise RuntimeError(f"MongoDB runtime initialization failed: {exc}") from exc
 
 
-def mongo_inventory_collection():
-    if mongo_repository is None:
-        raise RuntimeError("MongoDB runtime has not been initialized")
-    return mongo_repository.collection("inventory")
-
-
-def stock_row_to_doc(row):
-    if not isinstance(row, tuple):
-        row = tuple(row)
-    data = {
-        "phone": row[0],
-        "session_file": row[1],
-        "country_name": row[2],
-        "country_icon": row[3] if len(row) > 3 and row[3] else "🌍",
-        "account_year": row[4] if len(row) > 4 else None,
-        "category": row[5] if len(row) > 5 else "Good",
-        "price": int(row[6]) if len(row) > 6 and row[6] is not None else 0,
-        "available": int(row[7]) if len(row) > 7 and row[7] is not None else 1,
-        "twofa": row[8] if len(row) > 8 and row[8] else "None",
-        "added_date": row[9] if len(row) > 9 else None,
-    }
-    if len(row) > 10 and row[10] is not None:
-        data["data_center"] = row[10]
-    return data
-
-
-def upsert_stock_doc_to_mongo(doc):
-    collection = mongo_inventory_collection()
-    if not collection or not doc or not doc.get("phone"):
-        return False
-    try:
-        collection.update_one({"phone": doc["phone"]}, {"$set": doc}, upsert=True)
-        return True
-    except Exception as exc:
-        logger.warning("Mongo inventory upsert failed for %s: %s", doc.get("phone"), exc)
-        return False
-
-
-def set_stock_available_in_mongo(phone, available):
-    collection = mongo_inventory_collection()
-    if not collection or not phone:
-        return False
-    try:
-        collection.update_one({"phone": phone}, {"$set": {"available": 1 if available else 0}}, upsert=False)
-        return True
-    except Exception as exc:
-        logger.warning("Mongo inventory availability update failed for %s: %s", phone, exc)
-        return False
-
-
-def migrate_sqlite_stock_to_mongo():
-    if "cur" not in globals() or cur is None:
-        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "db_not_ready"}
-
-    collection = mongo_inventory_collection()
-    if collection is None:
-        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "skipped_no_mongo"}
-
-    try:
-        cols = [row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()]
-        query = "SELECT phone, session_file, country_name, country_icon, account_year, category, price, available, twofa, added_date"
-        if "data_center" in cols:
-            query += ", data_center"
-        query += " FROM stock"
-        rows = cur.execute(query).fetchall()
-    except Exception as exc:
-        logger.warning("Mongo migration failed to read SQLite stock: %s", exc)
-        return {"total_old_records": 0, "migrated": 0, "skipped_duplicates": 0, "failed": 0, "status": "read_failed"}
-
-    stats = {"total_old_records": len(rows), "migrated": 0, "updated": 0, "skipped_duplicates": 0, "failed": 0}
-    for row in rows:
-        doc = stock_row_to_doc(row)
-        if not doc.get("phone"):
-            stats["failed"] += 1
-            continue
-        try:
-            result = collection.update_one(
-                {"phone": doc["phone"]},
-                {"$set": doc},
-                upsert=True,
-            )
-            if result.upserted_id is None:
-                stats["updated"] += 1
-            else:
-                stats["migrated"] += 1
-        except Exception as exc:
-            logger.warning("Failed to migrate stock item %s to Mongo: %s", doc.get("phone"), exc)
-            stats["failed"] += 1
-    return {"status": "ok", **stats}
-
-
-def inventory_count_from_mongo(filters=None):
-    collection = mongo_inventory_collection()
-    if collection is None:
-        return 0
-    try:
-        return collection.count_documents(filters or {})
-    except Exception as exc:
-        logger.warning("Mongo count_documents failed: %s", exc)
-        return 0
-
-
-def get_mongo_available_inventory():
-    collection = mongo_inventory_collection()
-    if collection is None:
-        return []
-    try:
-        return list(collection.find({"available": 1}, {"_id": 0}))
-    except Exception as exc:
-        logger.warning("Mongo inventory read failed: %s", exc)
-        return []
-
-
-def sync_stock_phones_to_mongo(phones):
-    """Mirror the current SQLite stock rows for the supplied phone numbers."""
-    unique_phones = tuple(dict.fromkeys(str(phone) for phone in phones if phone))
-    if not unique_phones:
-        return 0
-
-    collection = mongo_inventory_collection()
-    if collection is None:
-        return 0
-
-    try:
-        columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
-        fields = [
-            "phone", "session_file", "country_name", "country_icon",
-            "account_year", "category", "price", "available", "twofa", "added_date"
-        ]
-        if "data_center" in columns:
-            fields.append("data_center")
-        query = f"SELECT {', '.join(fields)} FROM stock WHERE phone=?"
-    except Exception as exc:
-        logger.warning("Mongo inventory sync failed to inspect SQLite stock: %s", exc)
-        return 0
-
-    synced = 0
-    for phone in unique_phones:
-        try:
-            row = cur.execute(query, (phone,)).fetchone()
-            if row:
-                collection.update_one(
-                    {"phone": phone},
-                    {"$set": stock_row_to_doc(row)},
-                    upsert=True,
-                )
-            else:
-                # This exact stock row was intentionally removed from SQLite.
-                collection.delete_one({"phone": phone})
-            synced += 1
-        except Exception as exc:
-            logger.warning("Mongo inventory sync failed for %s: %s", phone, exc)
-    return synced
-
-
 validate_config()
 initialize_mongo_runtime()
 
@@ -1338,59 +1183,24 @@ async def submit_utr_handler(event, order_id):
 
 # ================= BUYING FLOW =================
 def get_available_account_products():
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
-    dc_expression = "data_center" if "data_center" in columns else "NULL"
-    query = f"""
-        SELECT country_icon, country_name, COALESCE(category, ''), account_year, price,
-               COUNT(*), MIN(phone), {dc_expression}
-        FROM stock
-        WHERE available=1
-        GROUP BY country_icon, country_name, COALESCE(category, ''), account_year, price, {dc_expression}
-        ORDER BY country_name ASC, account_year DESC, price ASC
-    """
-    rows = cur.execute(query).fetchall()
-    return [
-        {
-            "icon": row[0] or "🌍",
-            "country": row[1] or "Unknown",
-            "category": row[2] or "",
-            "year": row[3],
-            "price": int(row[4] or 0),
-            "stock": int(row[5] or 0),
-            "phone": row[6],
-            "dc": None if row[7] in (None, "", "None", "NULL") else row[7]
-        }
-        for row in rows
-    ]
+    return mongo_store.inventory_products()
 
 
 def get_product_stock(product):
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     category = normalize_optional_text(product.get("category"))
     dc = product.get("dc")
     if dc is not None and str(dc).strip().lower() in {"none", "null", ""}:
         dc = None
-
-    query = (
-        "SELECT COUNT(*) FROM stock WHERE available=1 AND country_name=? AND account_year=? AND price=?"
+    filters = mongo_store.inventory_filter(
+        country=product["country"],
+        year=product["year"],
+        price=product["price"],
+        category=category,
+        dc=dc,
+        available=1,
+        country_prefix=False,
     )
-    params = [product["country"], product["year"], product["price"]]
-
-    if category:
-        query += " AND COALESCE(category, '')=?"
-        params.append(category)
-    else:
-        query += " AND (COALESCE(category, '')='' OR category IS NULL)"
-
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(str(dc))
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-
-    row = cur.execute(query, params).fetchone()
-    return row[0] if row else 0
+    return mongo_store.count_inventory(filters)
 
 
 def get_product_token(product):
@@ -1537,7 +1347,23 @@ async def show_countries(event, flow, page=1):
     return await render_account_store(event, flow, page, send_banner=not isinstance(event, events.CallbackQuery.Event))
 
 async def show_years(event, flow, country):
-    rows = cur.execute("SELECT account_year, price, COUNT(*) FROM stock WHERE available=1 AND country_name LIKE ? GROUP BY account_year, price ORDER BY account_year DESC", (f"{country}%",)).fetchall()
+    grouped = {}
+    for document in mongo_store.list_inventory(
+        {
+            "country_name": {
+                "$regex": f"^{re.escape(str(country))}",
+                "$options": "i",
+            },
+            "available": 1,
+        }
+    ):
+        key = (document.get("account_year"), int(document.get("price") or 0))
+        grouped[key] = grouped.get(key, 0) + 1
+    rows = sorted(
+        [(year, price, count) for (year, price), count in grouped.items()],
+        key=lambda row: str(row[0]),
+        reverse=True,
+    )
     if not rows: return await event.answer("❌ Out of stock for this country.", alert=True)
 
     uid = event.sender_id
@@ -1583,37 +1409,33 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
     discount = get_user_discount(uid)
     final_price = base_price if discount == 0 else int(base_price * (100 - discount) / 100)
 
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     category = (category or "Standard").strip() or "Standard"
     dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
-    query = (
-        "SELECT phone, session_file, country_icon, account_year, twofa FROM stock "
-        "WHERE country_name LIKE ? AND account_year=? AND price=? AND available=1 AND category=?"
-    )
-    params = [f"{country}%", int(year_str), base_price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(dc)
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-
     async with get_user_lock(uid):
-        row = cur.execute(query, params).fetchone()
-        if not row:
+        reserved = mongo_store.reserve_inventory_item(
+            country, year_str, base_price, category, dc
+        )
+        if not reserved:
             return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
-        
-        phone, sess, c_icon, actual_year, twofa_pass = row
 
-        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
-        if cur.rowcount == 0:
-            return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
+        phone = reserved["phone"]
+        sess = reserved["session_file"]
+        c_icon = reserved.get("country_icon") or "🌍"
+        actual_year = reserved.get("account_year")
+        twofa_pass = reserved.get("twofa") or "None"
 
-        cur.execute("UPDATE stock SET available=0 WHERE phone=?", (phone,))
-        db.commit()
+        try:
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_price, uid, final_price))
+            if cur.rowcount == 0:
+                mongo_store.release_inventory([phone])
+                return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
+            db.commit()
+        except Exception:
+            db.rollback()
+            mongo_store.release_inventory([phone])
+            raise
 
-    sync_stock_phones_to_mongo([phone])
     await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
     clean_sess = sess if not sess.endswith(".session") else sess[:-8]
     client = TelegramClient(clean_sess, API_ID, API_HASH)
@@ -1623,10 +1445,9 @@ async def process_purchase(event, country, year_str, price_str, category=None, d
         if not await client.is_user_authorized(): raise Exception("Session dead")
     except Exception:
         async with get_user_lock(uid):
-            cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
+            mongo_store.delete_inventory(phone)
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (final_price, uid))
             db.commit()
-        sync_stock_phones_to_mongo([phone])
         await client.disconnect()
         delete_session_files(sess)
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
@@ -1675,9 +1496,8 @@ async def auto_otp_task(phone):
                     order['paid'] = True
                     async with get_user_lock(uid):
                         cur.execute("INSERT INTO orders (user_id, country, year, price, phone, otp) VALUES (?,?,?,?,?,?)", (uid, order['country'], order['year'], order['price'], phone, code))
-                        cur.execute("DELETE FROM stock WHERE phone=?", (phone,))
                         db.commit()
-                    sync_stock_phones_to_mongo([phone])
+                    mongo_store.delete_inventory(phone)
                     
                     await log_primary_purchase(uid, order['country'], order['price'], order['price'], order['year'], 1)
                 
@@ -1704,30 +1524,27 @@ async def auto_otp_task(phone):
         
         async with get_user_lock(uid):
             cur.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (order['price'], uid))
-            cur.execute("UPDATE stock SET available=1 WHERE phone=?", (phone,))
             db.commit()
-        sync_stock_phones_to_mongo([phone])
+        mongo_store.set_inventory_available(phone, 1)
             
         try: await bot.edit_message(uid, msg_id, f"{P_TIME} <b>Order Expired!</b>\nThe 10-minute limit for <code>{phone}</code> ran out. Your money ({P_INR}{order['price']}) has been automatically refunded.")
         except: pass
 
 async def init_session_purchase(event, country, year, price_str, category=None, dc=None):
     uid, price = event.sender_id, int(price_str)
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
     category = (category or "Standard").strip() or "Standard"
     dc = None if dc is None or str(dc).strip().lower() in {"none", "null", ""} else str(dc)
 
-    query = "SELECT COUNT(*) FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
-    params = [f"{country}%", int(year), price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(dc)
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-
-    stock_row = cur.execute(query, params).fetchone()
-    stock = stock_row[0] if stock_row else 0
+    stock = mongo_store.count_inventory(
+        mongo_store.inventory_filter(
+            country=country,
+            year=year,
+            price=price,
+            category=category,
+            dc=dc,
+            available=1,
+        )
+    )
     if stock == 0: return await event.answer("❌ Out of stock!", alert=True)
     
     session_buy_state[uid] = {'country': country, 'year': year, 'price': price, 'stock': stock, 'category': category, 'dc': dc}
@@ -1748,43 +1565,38 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
         dc = None
     await event.respond(f"{PE_LIGHTNING} <b>Processing your sessions...</b>")
 
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
-    query = "SELECT phone, session_file, twofa, account_year FROM stock WHERE country_name LIKE ? AND account_year=? AND price=? AND category=? AND available=1"
-    params = [f"{country}%", year, price, category]
-    if "data_center" in columns:
-        if dc is not None:
-            query += " AND data_center=?"
-            params.append(str(dc))
-        else:
-            query += " AND (data_center IS NULL OR data_center='' OR data_center='None')"
-    query += " LIMIT ?"
-    params.append(qty)
-
     async with get_user_lock(uid):
-        rows = cur.execute(query, params).fetchall()
-        if len(rows) < qty:
+        reserved = mongo_store.reserve_inventory(
+            qty, country, year, price, category, dc
+        )
+        if len(reserved) < qty:
             return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
         
-        cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
-        if cur.rowcount == 0:
-            return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
+        try:
+            cur.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (final_cost, uid, final_cost))
+            if cur.rowcount == 0:
+                mongo_store.release_inventory(item["phone"] for item in reserved)
+                return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
 
-        phones = [r[0] for r in rows]
-        placeholders = ",".join("?" for _ in phones)
-        cur.execute(f"UPDATE stock SET available=0 WHERE phone IN ({placeholders})", phones)
-        
-        price_per_acc = final_cost // qty
-        for p in phones:
-            cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
-        db.commit()
-    sync_stock_phones_to_mongo(phones)
+            phones = [item["phone"] for item in reserved]
+            price_per_acc = final_cost // qty
+            for p in phones:
+                cur.execute("INSERT INTO orders (user_id, country, price, phone, otp) VALUES (?,?,?,?,?)", (uid, country, price_per_acc, p, "SESSION_FILES"))
+            db.commit()
+        except Exception:
+            db.rollback()
+            mongo_store.release_inventory(item["phone"] for item in reserved)
+            raise
 
     zip_name = f"sessions_{uid}_{int(time.time())}.zip"
     numbers_txt = ""
 
     try:
         with zipfile.ZipFile(zip_name, 'w') as zf:
-            for phone, sess_file, twofa_pass, y in rows:
+            for item in reserved:
+                phone = item["phone"]
+                sess_file = item["session_file"]
+                twofa_pass = item.get("twofa") or "None"
                 base_s = sess_file if not sess_file.endswith(".session") else sess_file[:-8]
                 for ext in ['.session', '.session-wal', '.session-shm', '.session-journal']:
                     src = base_s + ext
@@ -1890,7 +1702,7 @@ async def admin_panel_handler(event):
     
     status_text = "🟢 Bot is ON" if is_bot_online() else "🔴 Bot is OFF"
     total_users = mongo_store.count_users()
-    total_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+    total_stock = mongo_store.count_inventory({"available": 1})
     pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     btns = []
     
@@ -2022,8 +1834,8 @@ async def render_admin_stats(event, period="all"):
     )
     top_referrers = mongo_store.top_referrers()
 
-    available_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
-    used_stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=0").fetchone()[0]
+    available_stock = mongo_store.count_inventory({"available": 1})
+    used_stock = mongo_store.count_inventory({"available": 0})
     pending_deposits = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
     top_text = "Unavailable"
     if top_referrers:
@@ -2227,7 +2039,7 @@ async def edit_admin_menu(event, target_id):
 async def send_manage_stock_page(event, page):
     limit = 10
     offset = (page - 1) * limit
-    rows = cur.execute("SELECT DISTINCT country_name FROM stock ORDER BY country_name").fetchall()
+    rows = [(country,) for country in mongo_store.list_inventory_countries()]
     total = len(rows)
     countries = rows[offset:offset+limit]
     
@@ -2244,7 +2056,7 @@ async def send_manage_stock_page(event, page):
     await event.edit(f"{PE_LOCATION} <b>Manage Stock</b> (Page {page})\nSelect a country to edit its properties:", buttons=btns)
 
 async def send_manage_stock_country(event, c_name):
-    years = cur.execute("SELECT DISTINCT account_year FROM stock WHERE country_name=? ORDER BY account_year DESC", (c_name,)).fetchall()
+    years = [(year,) for year in mongo_store.list_inventory_years(c_name)]
     flag = get_flag_by_country_name(c_name)
     btns = [
         [Button.inline("Edit Country Name", f"adm_msedit|name|{c_name}"), Button.inline("Edit Flag", f"adm_msedit|flag|{c_name}")],
@@ -2261,8 +2073,8 @@ async def send_autoprice_page(event, page):
     limit = 10
     offset = (page - 1) * limit
     c_list = set([c[0] for c in COUNTRY_CODES.values()])
-    db_countries = cur.execute("SELECT DISTINCT country_name FROM stock").fetchall()
-    for (c,) in db_countries: c_list.add(c)
+    for c in mongo_store.list_inventory_countries():
+        c_list.add(c)
     
     custom_countries = mongo_store.list_custom_countries()
     for country in custom_countries:
@@ -2743,44 +2555,26 @@ async def admin_actions(event):
                 
                 if action == "name":
                     new_name = html.escape((await get_reply(f"{P_DOC} <b>Enter NEW Name for {c_name}:</b>")).text)
-                    affected_phones = [row[0] for row in cur.execute(
-                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
-                    ).fetchall()]
-                    cur.execute("UPDATE stock SET country_name=? WHERE country_name=?", (new_name, c_name))
-                    cur.execute("UPDATE auto_prices SET country=? WHERE country=?", (new_name, c_name))
-                    db.commit()
-                    sync_stock_phones_to_mongo(affected_phones)
+                    mongo_store.rename_inventory_country(c_name, new_name)
+                    mongo_store.rename_auto_price_country(c_name, new_name)
                     await conv.send_message(f"{P_YES} Country '{c_name}' successfully renamed to '{new_name}'!")
                     
                 elif action == "flag":
                     new_flag = html.escape((await get_reply(f"{P_FLAG} <b>Enter NEW Flag Emoji for {c_name}:</b>")).text)
-                    affected_phones = [row[0] for row in cur.execute(
-                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
-                    ).fetchall()]
-                    cur.execute("UPDATE stock SET country_icon=? WHERE country_name=?", (new_flag, c_name))
-                    db.commit()
-                    sync_stock_phones_to_mongo(affected_phones)
+                    mongo_store.update_inventory_by_country(c_name, {"country_icon": new_flag})
                     await conv.send_message(f"{P_YES} Flag updated to {new_flag} for '{c_name}'!")
                     
                 elif action == "cprice":
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Common Price for all {c_name} accounts:</b>")).text)
-                    affected_phones = [row[0] for row in cur.execute(
-                        "SELECT phone FROM stock WHERE country_name=?", (c_name,)
-                    ).fetchall()]
-                    cur.execute("UPDATE stock SET price=? WHERE country_name=?", (new_p, c_name))
-                    db.commit()
-                    sync_stock_phones_to_mongo(affected_phones)
+                    mongo_store.update_inventory_by_country(c_name, {"price": new_p})
                     await conv.send_message(f"{P_YES} All existing '{c_name}' accounts updated to {P_INR}{new_p}!")
                     
                 elif action == "yprice":
                     year = parts[3]
                     new_p = int((await get_reply(f"{P_MONEY} <b>Enter NEW Price for {c_name} ({year}):</b>")).text)
-                    affected_phones = [row[0] for row in cur.execute(
-                        "SELECT phone FROM stock WHERE country_name=? AND account_year=?", (c_name, year)
-                    ).fetchall()]
-                    cur.execute("UPDATE stock SET price=? WHERE country_name=? AND account_year=?", (new_p, c_name, year))
-                    db.commit()
-                    sync_stock_phones_to_mongo(affected_phones)
+                    mongo_store.update_inventory_by_country(
+                        c_name, {"price": new_p}, year=year
+                    )
                     await conv.send_message(f"{P_YES} All existing '{c_name}' ({year}) accounts updated to {P_INR}{new_p}!")
                     
             elif action_data.startswith("apset|") and (uid in ADMIN_IDS or has_perm(uid, 'p_manage_stock')):
@@ -2788,12 +2582,11 @@ async def admin_actions(event):
                 c_name, year = parts[1], parts[2]
                 new_p = int((await get_reply(f"{P_ASST} <b>Enter Auto-Price for {c_name} ({year}):</b>\n<i>(Enter 0 to remove this auto-price)</i>")).text)
                 if new_p == 0:
-                    cur.execute("DELETE FROM auto_prices WHERE country=? AND year=?", (c_name, year))
+                    mongo_store.delete_auto_price(c_name, year)
                     await conv.send_message(f"{P_YES} Auto-Price for {c_name} ({year}) removed!")
                 else:
-                    cur.execute("INSERT OR REPLACE INTO auto_prices (country, year, price) VALUES (?,?,?)", (c_name, year, new_p))
+                    mongo_store.set_auto_price(c_name, year, new_p)
                     await conv.send_message(f"{P_YES} Auto-Price for {c_name} ({year}) set to {P_INR}{new_p}! Incoming accounts will use this price automatically.")
-                db.commit()
 
             elif action_data == "addpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 name = html.escape((await get_reply(f"{P_CARD} <b>Enter Payment Method Name:</b>\n<i>(e.g., Binance Pay, TRX)</i>")).text)
@@ -2880,16 +2673,17 @@ async def admin_actions(event):
                     twofa_pass = "None"
                     if has_2fa: twofa_pass = html.escape((await get_reply(f"{P_2FA} <b>Enter 2FA Password for {len(accs)}x {c_name} accounts:</b>")).text)
 
-                    auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year=?", (c_name, str(year))).fetchone()
-                    if not auto_row: auto_row = cur.execute("SELECT price FROM auto_prices WHERE country=? AND year='Common'", (c_name,)).fetchone()
+                    auto_price = mongo_store.get_auto_price(c_name, str(year))
+                    if auto_price is None:
+                        auto_price = mongo_store.get_auto_price(c_name, "Common")
 
-                    if auto_row:
-                        price = auto_row[0]
+                    if auto_price is not None:
+                        price = auto_price
                         await conv.send_message(f"⚡ <b>Auto-Price Applied:</b> {len(accs)}x {c_name} ({year}) at {P_INR}{price}.")
                     else:
-                        existing_price = cur.execute("SELECT price FROM stock WHERE country_name=? LIMIT 1", (c_name,)).fetchone()
-                        if existing_price:
-                            price = existing_price[0]
+                        existing_price = mongo_store.inventory_price_for_country(c_name)
+                        if existing_price is not None:
+                            price = existing_price
                             await conv.send_message(f"⚡ <b>Auto-Added:</b> {len(accs)}x {c_name} at {P_INR}{price} (Copied from DB).")
                         else:
                             price = int((await get_reply(f"📌 Found {len(accs)}x {c_name} ({year}).\n{P_MONEY} Enter Price (₹):")).text)
@@ -2898,12 +2692,21 @@ async def admin_actions(event):
                         perm_base = f"sessions/{acc['phone']}"
                         for ext in ['.session', '.session-wal', '.session-shm', '.session-journal']:
                             if os.path.exists(acc['path'] + ext): shutil.move(acc['path'] + ext, perm_base + ext)
-                        cur.execute("INSERT OR REPLACE INTO stock (phone, session_file, country_name, country_icon, account_year, category, price, available, twofa) VALUES (?,?,?,?,?,?,?,?,?)", 
-                                    (acc['phone'], perm_base + ".session", c_name, c_icon, year, 'Good', price, 1, twofa_pass))
+                        mongo_store.save_inventory({
+                            "phone": acc["phone"],
+                            "session_file": perm_base + ".session",
+                            "country_name": c_name,
+                            "country_icon": c_icon,
+                            "account_year": year,
+                            "category": "Good",
+                            "price": price,
+                            "available": 1,
+                            "twofa": twofa_pass,
+                            "added_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                            "data_center": None,
+                        })
                         added_phones.append(acc['phone'])
                         success += 1
-                db.commit()
-                sync_stock_phones_to_mongo(added_phones)
                 os.remove(zip_path); shutil.rmtree(extracted_dir)
                 await conv.send_message(f"{P_YES} <b>Bulk Interactive Upload Complete!</b>\n{P_ON} Added: {success}")
 
@@ -2971,18 +2774,19 @@ async def admin_actions(event):
                     year = auto_year
                 await client.disconnect()
 
-                stock_columns = {row[1] for row in cur.execute("PRAGMA table_info(stock)").fetchall()}
-                insert_columns = ["phone", "session_file", "country_name", "country_icon", "account_year", "category", "price", "available", "twofa"]
-                insert_values = [phone, sp + ".session", c_name, c_icon, year, category, price, 1, twofa_pass]
-                if "data_center" in stock_columns:
-                    insert_columns.append("data_center")
-                    insert_values.append(dc)
-                cur.execute(
-                    f"INSERT OR REPLACE INTO stock ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
-                    insert_values
-                )
-                db.commit()
-                sync_stock_phones_to_mongo([phone])
+                mongo_store.save_inventory({
+                    "phone": phone,
+                    "session_file": sp + ".session",
+                    "country_name": c_name,
+                    "country_icon": c_icon,
+                    "account_year": year,
+                    "category": category,
+                    "price": price,
+                    "available": 1,
+                    "twofa": twofa_pass,
+                    "added_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "data_center": dc,
+                })
                 usd_price = to_usd(price)
                 display = f"{c_icon} {c_name}"
                 if category:

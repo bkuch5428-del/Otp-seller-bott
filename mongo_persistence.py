@@ -9,12 +9,13 @@ It provides:
 * a non-destructive counter initializer; and
 * runtime helpers for the selected user/settings/admin/custom-definition cutover.
 
-Inventory, deposits, orders, and balance mutations remain SQLite-backed until
-their dedicated migration phases.
+Deposits, orders, and balance mutations remain SQLite-backed until their
+dedicated migration phases.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -595,12 +596,11 @@ class MongoRepository:
 
 
 class MongoRuntimeStore:
-    """Runtime accessors for the collections migrated in the first cutover.
+    """Runtime accessors for the Mongo-backed portions of the bot.
 
-    This intentionally covers user metadata, settings, admin permissions,
-    custom countries, and custom payment definitions only. Inventory,
-    deposits, orders, and balance mutations remain in the legacy SQLite
-    runtime until their dedicated migration phases.
+    Inventory reservations use MongoDB's atomic ``find_one_and_update``.
+    Deposits, orders, and balance mutations remain in SQLite until their
+    dedicated migration phases.
     """
 
     ADMIN_PERMISSIONS = {
@@ -643,6 +643,296 @@ class MongoRuntimeStore:
     @property
     def custom_payments(self) -> Any:
         return self.repository.collection("custom_payments")
+
+    @property
+    def inventory(self) -> Any:
+        return self.repository.collection("inventory")
+
+    @property
+    def auto_prices(self) -> Any:
+        return self.repository.collection("auto_prices")
+
+    @staticmethod
+    def _normalise_inventory_dc(value: Any) -> str | None:
+        if value is None or str(value).strip().lower() in {"", "none", "null"}:
+            return None
+        return str(value)
+
+    @classmethod
+    def inventory_filter(
+        cls,
+        country: str | None = None,
+        year: Any = None,
+        price: Any = None,
+        category: str | None = None,
+        dc: Any = None,
+        available: int | None = None,
+        country_prefix: bool = True,
+    ) -> dict[str, Any]:
+        filters: dict[str, Any] = {}
+        if country is not None:
+            country_text = str(country)
+            pattern = (
+                f"^{re.escape(country_text)}"
+                if country_prefix
+                else f"^{re.escape(country_text)}$"
+            )
+            filters["country_name"] = {"$regex": pattern, "$options": "i"}
+        if year is not None:
+            filters["account_year"] = int(year)
+        if price is not None:
+            filters["price"] = int(price)
+        if available is not None:
+            filters["available"] = int(available)
+
+        category_text = "" if category is None else str(category).strip()
+        filters["category"] = category_text if category_text else {"$in": [None, ""]}
+
+        normalised_dc = cls._normalise_inventory_dc(dc)
+        filters["data_center"] = (
+            normalised_dc
+            if normalised_dc is not None
+            else {"$in": [None, "", "None", "NULL"]}
+        )
+        return filters
+
+    def list_inventory(
+        self, filters: Mapping[str, Any] | None = None
+    ) -> list[Mapping[str, Any]]:
+        return list(self.inventory.find(dict(filters or {})))
+
+    def count_inventory(self, filters: Mapping[str, Any] | None = None) -> int:
+        return int(self.inventory.count_documents(dict(filters or {})))
+
+    def inventory_products(self) -> list[dict[str, Any]]:
+        """Return the grouped product shape used by the Telegram store."""
+        groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for document in self.inventory.find({"available": 1}):
+            category = document.get("category") or ""
+            dc = self._normalise_inventory_dc(document.get("data_center"))
+            icon = document.get("country_icon") or "🌍"
+            key = (
+                document.get("country_name"),
+                icon,
+                category,
+                document.get("account_year"),
+                int(document.get("price") or 0),
+                dc,
+            )
+            product = groups.get(key)
+            if product is None:
+                product = {
+                    "icon": icon,
+                    "country": document.get("country_name") or "Unknown",
+                    "category": category,
+                    "year": document.get("account_year"),
+                    "price": int(document.get("price") or 0),
+                    "stock": 0,
+                    "phone": document.get("phone"),
+                    "dc": dc,
+                }
+                groups[key] = product
+            product["stock"] += 1
+            if document.get("phone") is not None and (
+                product["phone"] is None
+                or str(document["phone"]) < str(product["phone"])
+            ):
+                product["phone"] = document["phone"]
+
+        def sort_key(product: Mapping[str, Any]) -> tuple[Any, ...]:
+            year = product.get("year")
+            try:
+                year_key = -int(year)
+            except (TypeError, ValueError):
+                year_key = 0
+            return (
+                str(product.get("country") or "").lower(),
+                year_key,
+                int(product.get("price") or 0),
+            )
+
+        return sorted(groups.values(), key=sort_key)
+
+    def list_inventory_countries(self) -> list[str]:
+        countries = {
+            str(document["country_name"])
+            for document in self.inventory.find({})
+            if document.get("country_name")
+        }
+        return sorted(countries)
+
+    def list_inventory_years(self, country: str) -> list[Any]:
+        years = {
+            document.get("account_year")
+            for document in self.inventory.find(
+                {"country_name": str(country)}
+            )
+        }
+        return sorted(
+            years,
+            key=lambda value: (isinstance(value, str), str(value)),
+            reverse=True,
+        )
+
+    def inventory_price_for_country(self, country: str) -> int | None:
+        document = self.inventory.find_one({"country_name": str(country)})
+        if not document:
+            return None
+        return int(document.get("price") or 0)
+
+    def save_inventory(self, document: Mapping[str, Any]) -> Any:
+        phone = document.get("phone")
+        if not phone:
+            raise ValueError("inventory document is missing phone")
+        values = dict(document)
+        values.pop("_id", None)
+        # $set preserves any extra fields already present in Mongo.
+        return self.inventory.update_one(
+            {"phone": phone},
+            {"$set": values},
+            upsert=True,
+        )
+
+    def update_inventory_by_country(
+        self,
+        country: str,
+        fields: Mapping[str, Any],
+        *,
+        year: Any = None,
+    ) -> int:
+        filters = self.inventory_filter(
+            country=country,
+            year=year,
+            country_prefix=False,
+        )
+        filters.pop("available", None)
+        filters.pop("category", None)
+        filters.pop("data_center", None)
+        result = self.inventory.update_many(filters, {"$set": dict(fields)})
+        return int(
+            getattr(result, "modified_count", getattr(result, "matched_count", 0))
+        )
+
+    def rename_inventory_country(self, country: str, new_name: str) -> int:
+        return self.update_inventory_by_country(
+            country,
+            {"country_name": new_name},
+        )
+
+    def delete_inventory(self, phone: Any) -> int:
+        result = self.inventory.delete_one({"phone": phone})
+        return int(getattr(result, "deleted_count", 0))
+
+    def set_inventory_available(self, phone: Any, available: int) -> bool:
+        result = self.inventory.update_one(
+            {"phone": phone},
+            {"$set": {"available": 1 if available else 0}},
+        )
+        return bool(getattr(result, "matched_count", 0))
+
+    def reserve_inventory_item(
+        self,
+        country: str,
+        year: Any,
+        price: Any,
+        category: str | None = None,
+        dc: Any = None,
+    ) -> Mapping[str, Any] | None:
+        """Atomically mark and return one matching available inventory item."""
+        filters = self.inventory_filter(
+            country=country,
+            year=year,
+            price=price,
+            category=category,
+            dc=dc,
+            available=1,
+        )
+        return self.inventory.find_one_and_update(
+            filters,
+            {"$set": {"available": 0}},
+            return_document=1,  # pymongo ReturnDocument.AFTER
+        )
+
+    def reserve_inventory(
+        self,
+        quantity: int,
+        country: str,
+        year: Any,
+        price: Any,
+        category: str | None = None,
+        dc: Any = None,
+    ) -> list[Mapping[str, Any]]:
+        """Reserve exactly quantity, releasing every partial reservation."""
+        if quantity < 1:
+            raise ValueError("inventory reservation quantity must be positive")
+        reserved: list[Mapping[str, Any]] = []
+        for _ in range(int(quantity)):
+            document = self.reserve_inventory_item(
+                country, year, price, category, dc
+            )
+            if document is None:
+                self.release_inventory(item["phone"] for item in reserved)
+                return []
+            reserved.append(document)
+        return reserved
+
+    def release_inventory(self, phones: Iterable[Any]) -> int:
+        released = 0
+        for phone in phones:
+            if self.set_inventory_available(phone, 1):
+                released += 1
+        return released
+
+    def get_auto_price(self, country: str, year: Any) -> int | None:
+        document = self.auto_prices.find_one(
+            {"country": str(country), "year": str(year)}
+        )
+        if document and document.get("price") is not None:
+            return int(document["price"])
+        return None
+
+    def set_auto_price(self, country: str, year: Any, price: Any) -> Any:
+        country_text, year_text = str(country), str(year)
+        return self.auto_prices.update_one(
+            {"country": country_text, "year": year_text},
+            {
+                "$set": {
+                    "country": country_text,
+                    "year": year_text,
+                    "price": int(price),
+                }
+            },
+            upsert=True,
+        )
+
+    def delete_auto_price(self, country: str, year: Any) -> int:
+        result = self.auto_prices.delete_one(
+            {"country": str(country), "year": str(year)}
+        )
+        return int(getattr(result, "deleted_count", 0))
+
+    def rename_auto_price_country(self, country: str, new_name: str) -> dict[str, int]:
+        """Rename auto-prices without overwriting conflicting target identities."""
+        old_docs = list(self.auto_prices.find({"country": str(country)}))
+        target_years = {
+            document.get("year")
+            for document in self.auto_prices.find({"country": str(new_name)})
+        }
+        updated = 0
+        conflicts = 0
+        for document in old_docs:
+            if document.get("year") in target_years:
+                conflicts += 1
+                continue
+            result = self.auto_prices.update_one(
+                {"_id": document["_id"]},
+                {"$set": {"country": str(new_name)}},
+            )
+            changed = int(getattr(result, "modified_count", 0))
+            updated += changed
+            if changed:
+                target_years.add(document.get("year"))
+        return {"updated": updated, "conflicts": conflicts}
 
     def ensure_user(self, user_id: int) -> None:
         """Create a user only when absent; never replace existing fields."""

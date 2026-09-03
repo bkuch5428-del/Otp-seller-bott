@@ -1,5 +1,7 @@
 import sqlite3
+import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -19,6 +21,7 @@ class FakeCollection:
         self.documents = []
         self.indexes = [{"name": "_id_", "key": {"_id": 1}, "unique": True}]
         self.create_index_calls = []
+        self._lock = threading.Lock()
 
     @staticmethod
     def matches(document, query):
@@ -33,6 +36,12 @@ class FakeCollection:
                     return False
                 if "$exists" in value and (key in document) != value["$exists"]:
                     return False
+                if "$in" in value and actual not in value["$in"]:
+                    return False
+                if "$regex" in value:
+                    options = re.IGNORECASE if "i" in value.get("$options", "") else 0
+                    if not re.search(value["$regex"], str(actual or ""), options):
+                        return False
                 continue
             if actual != value:
                 return False
@@ -62,39 +71,56 @@ class FakeCollection:
         )()
 
     def update_one(self, query, update, upsert=False):
-        document = next(
-            (item for item in self.documents if self.matches(item, query)),
-            None,
-        )
-        inserted = False
-        if document is None and upsert:
-            document = {
-                key: value for key, value in query.items()
-                if not key.startswith("$") and not isinstance(value, dict)
-            }
-            self.documents.append(document)
-            inserted = True
-        if document is None:
-            return type("UpdateResult", (), {"matched_count": 0, "modified_count": 0, "upserted_id": None})()
+        with self._lock:
+            document = next(
+                (item for item in self.documents if self.matches(item, query)),
+                None,
+            )
+            inserted = False
+            if document is None and upsert:
+                document = {
+                    key: value for key, value in query.items()
+                    if not key.startswith("$") and not isinstance(value, dict)
+                }
+                self.documents.append(document)
+                inserted = True
+            if document is None:
+                return type("UpdateResult", (), {"matched_count": 0, "modified_count": 0, "upserted_id": None})()
 
-        before = document.copy()
-        if inserted:
-            document.update(update.get("$setOnInsert", {}))
-        document.update(update.get("$set", {}))
-        for key, amount in update.get("$inc", {}).items():
-            document[key] = document.get(key, 0) + amount
-        for key, operation in update.get("$bit", {}).items():
-            if "xor" in operation:
-                document[key] = int(document.get(key, 0)) ^ int(operation["xor"])
-        return type(
-            "UpdateResult",
-            (),
-            {
-                "matched_count": 1,
-                "modified_count": int(document != before),
-                "upserted_id": document.get("_id") if inserted else None,
-            },
-        )()
+            before = document.copy()
+            if inserted:
+                document.update(update.get("$setOnInsert", {}))
+                if "_id" not in document:
+                    document["_id"] = len(self.documents)
+            document.update(update.get("$set", {}))
+            for key, amount in update.get("$inc", {}).items():
+                document[key] = document.get(key, 0) + amount
+            for key, operation in update.get("$bit", {}).items():
+                if "xor" in operation:
+                    document[key] = int(document.get(key, 0)) ^ int(operation["xor"])
+            return type(
+                "UpdateResult",
+                (),
+                {
+                    "matched_count": 1,
+                    "modified_count": int(document != before),
+                    "upserted_id": document.get("_id") if inserted else None,
+                },
+            )()
+
+    def update_many(self, query, update):
+        with self._lock:
+            matches = [item for item in self.documents if self.matches(item, query)]
+            for document in matches:
+                document.update(update.get("$set", {}))
+            return type(
+                "UpdateResult",
+                (),
+                {
+                    "matched_count": len(matches),
+                    "modified_count": len(matches),
+                },
+            )()
 
     def delete_one(self, query):
         for index, document in enumerate(self.documents):
@@ -136,14 +162,29 @@ class FakeCollection:
         ]
 
     def find_one_and_update(self, query, update, upsert=False, return_document=1):
-        document = self.find_one(query)
-        if document is None and upsert:
-            document = {"_id": query["_id"], "value": 0}
-            self.documents.append(document)
-        if document is None:
-            return None
-        document["value"] += update["$inc"]["value"]
-        return document.copy()
+        with self._lock:
+            document = next(
+                (item for item in self.documents if self.matches(item, query)),
+                None,
+            )
+            inserted = False
+            if document is None and upsert:
+                document = {
+                    key: value for key, value in query.items()
+                    if not key.startswith("$") and not isinstance(value, dict)
+                }
+                self.documents.append(document)
+                inserted = True
+            if document is None:
+                return None
+            if inserted:
+                document.update(update.get("$setOnInsert", {}))
+                if "_id" not in document:
+                    document["_id"] = len(self.documents)
+            document.update(update.get("$set", {}))
+            for key, amount in update.get("$inc", {}).items():
+                document[key] = document.get(key, 0) + amount
+            return document.copy()
 
 
 class FakeDatabase:
@@ -391,6 +432,144 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertEqual(store.get_custom_payment("Test Pay")["_id"], payment_id)
         store.delete_custom_payment(payment_id)
         self.assertIsNone(store.get_custom_payment("Test Pay"))
+
+    def make_store(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        return database, MongoRuntimeStore(repository)
+
+    @staticmethod
+    def inventory_document(phone, *, available=1, category="Good", dc=None, price=100):
+        return {
+            "phone": phone,
+            "session_file": f"sessions/{phone}.session",
+            "country_name": "India",
+            "country_icon": "🇮🇳",
+            "account_year": 2024,
+            "category": category,
+            "price": price,
+            "available": available,
+            "twofa": "None",
+            "data_center": dc,
+            "added_date": "2026-09-03 00:00:00",
+        }
+
+    def test_inventory_crud_preserves_extra_fields_and_invalid_records_fail(self):
+        _database, store = self.make_store()
+        document = self.inventory_document("9199990001")
+        document["provider_metadata"] = {"source": "legacy"}
+        store.save_inventory(document)
+
+        store.inventory.documents[0]["provider_metadata"] = {"source": "legacy"}
+        document["price"] = 125
+        store.save_inventory(document)
+        stored = store.inventory.find_one({"phone": "9199990001"})
+        self.assertEqual(stored["price"], 125)
+        self.assertEqual(stored["provider_metadata"], {"source": "legacy"})
+        self.assertTrue(store.set_inventory_available("9199990001", 0))
+        self.assertEqual(store.count_inventory({"available": 0}), 1)
+        self.assertEqual(store.delete_inventory("9199990001"), 1)
+        self.assertEqual(store.count_inventory(), 0)
+        with self.assertRaises(ValueError):
+            store.save_inventory({"session_file": "missing-phone.session"})
+
+    def test_inventory_product_lookup_and_grouping(self):
+        _database, store = self.make_store()
+        store.save_inventory(self.inventory_document("9199990002"))
+        store.save_inventory(self.inventory_document("9199990003", dc="dc2"))
+        store.save_inventory(self.inventory_document("9199990004", available=0))
+
+        products = store.inventory_products()
+        self.assertEqual(len(products), 2)
+        self.assertEqual({product["dc"] for product in products}, {None, "dc2"})
+        self.assertEqual(store.count_inventory(
+            store.inventory_filter(
+                country="India",
+                year=2024,
+                price=100,
+                category="Good",
+                dc=None,
+                available=1,
+                country_prefix=False,
+            )
+        ), 1)
+        self.assertEqual(store.list_inventory_countries(), ["India"])
+        self.assertEqual(store.list_inventory_years("India"), [2024])
+
+    def test_auto_price_crud_and_upsert(self):
+        _database, store = self.make_store()
+        store.set_auto_price("India", "2024", 150)
+        self.assertEqual(store.get_auto_price("India", 2024), 150)
+        store.auto_prices.documents[0]["extra"] = "kept"
+        store.set_auto_price("India", "2024", 175)
+        self.assertEqual(
+            store.auto_prices.count_documents({"country": "India", "year": "2024"}),
+            1,
+        )
+        self.assertEqual(store.get_auto_price("India", "2024"), 175)
+        self.assertEqual(store.auto_prices.documents[0]["extra"], "kept")
+        self.assertEqual(store.delete_auto_price("India", "2024"), 1)
+        self.assertIsNone(store.get_auto_price("India", "2024"))
+
+    def test_auto_price_country_rename_preserves_conflicting_target(self):
+        _database, store = self.make_store()
+        store.set_auto_price("Oldland", "2024", 100)
+        store.set_auto_price("Oldland", "2023", 90)
+        store.set_auto_price("Newland", "2024", 200)
+
+        result = store.rename_auto_price_country("Oldland", "Newland")
+
+        self.assertEqual(result, {"updated": 1, "conflicts": 1})
+        self.assertEqual(store.get_auto_price("Newland", "2024"), 200)
+        self.assertEqual(store.get_auto_price("Newland", "2023"), 90)
+        self.assertEqual(store.get_auto_price("Oldland", "2024"), 100)
+
+    def test_atomic_single_item_reservation_allows_only_one_winner(self):
+        _database, store = self.make_store()
+        store.save_inventory(self.inventory_document("9199990005"))
+        barrier = threading.Barrier(2)
+        results = []
+
+        def reserve():
+            barrier.wait()
+            results.append(store.reserve_inventory_item("India", 2024, 100, "Good"))
+
+        threads = [threading.Thread(target=reserve) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        winners = [result for result in results if result is not None]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(winners[0]["phone"], "9199990005")
+        self.assertEqual(store.count_inventory({"available": 1}), 0)
+
+    def test_bulk_reservation_is_concurrency_safe_and_releases_partial_attempts(self):
+        _database, store = self.make_store()
+        for index in range(5):
+            store.save_inventory(self.inventory_document(f"919999001{index}"))
+        barrier = threading.Barrier(2)
+        results = []
+
+        def reserve_bulk():
+            barrier.wait()
+            results.append(store.reserve_inventory(3, "India", 2024, 100, "Good"))
+
+        threads = [threading.Thread(target=reserve_bulk) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        completed = [result for result in results if result]
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(len(completed[0]), 3)
+        reserved_phones = {item["phone"] for item in completed[0]}
+        self.assertEqual(len(reserved_phones), 3)
+        self.assertEqual(store.count_inventory({"available": 0}), 3)
+        self.assertEqual(store.count_inventory({"available": 1}), 2)
 
 
 if __name__ == "__main__":
