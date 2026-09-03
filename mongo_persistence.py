@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from pymongo import ReturnDocument
+
 
 COLLECTION_NAMES = (
     "users",
@@ -603,7 +605,7 @@ class MongoRepository:
             {"_id": counter_name},
             {"$inc": {"value": 1}},
             upsert=True,
-            return_document=1,  # pymongo ReturnDocument.AFTER
+            return_document=ReturnDocument.AFTER,
         )
         if not result or not isinstance(result.get("value"), int):
             raise RuntimeError(f"Counter did not return an integer: {counter_name}")
@@ -872,7 +874,7 @@ class MongoRuntimeStore:
         return self.inventory.find_one_and_update(
             filters,
             {"$set": {"available": 0}},
-            return_document=1,  # pymongo ReturnDocument.AFTER
+            return_document=ReturnDocument.AFTER,
         )
 
     def reserve_inventory(

@@ -5,6 +5,8 @@ import threading
 import unittest
 from pathlib import Path
 
+from pymongo import ReturnDocument
+
 from mongo_persistence import (
     COLLECTION_NAMES,
     MongoRepository,
@@ -183,7 +185,18 @@ class FakeCollection:
             if len(ids) > 1
         ]
 
-    def find_one_and_update(self, query, update, upsert=False, return_document=1):
+    def find_one_and_update(
+        self,
+        query,
+        update,
+        upsert=False,
+        return_document=ReturnDocument.BEFORE,
+    ):
+        if return_document not in (ReturnDocument.BEFORE, ReturnDocument.AFTER):
+            raise ValueError(
+                "return_document must be ReturnDocument.BEFORE or "
+                "ReturnDocument.AFTER"
+            )
         with self._lock:
             document = next(
                 (item for item in self.documents if self.matches(item, query)),
@@ -199,6 +212,7 @@ class FakeCollection:
                 inserted = True
             if document is None:
                 return None
+            before = document.copy()
             if inserted:
                 document.update(update.get("$setOnInsert", {}))
                 if "_id" not in document:
@@ -206,7 +220,11 @@ class FakeCollection:
             document.update(update.get("$set", {}))
             for key, amount in update.get("$inc", {}).items():
                 document[key] = document.get(key, 0) + amount
-            return document.copy()
+            return (
+                document.copy()
+                if return_document == ReturnDocument.AFTER
+                else before
+            )
 
 
 class FakeDatabase:
@@ -617,6 +635,7 @@ class MongoPersistenceTests(unittest.TestCase):
         )
 
         self.assertEqual(reserved["phone"], "9199990006")
+        self.assertEqual(reserved["available"], 0)
         self.assertEqual(store.count_inventory({"available": 1}), 0)
 
     def test_runtime_order_creation_preserves_numeric_ids_and_is_retry_safe(self):
@@ -657,6 +676,44 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertFalse(store.claim_purchase_callback(30, 99, 501))
         self.assertTrue(store.claim_purchase_callback(30, 99, 502))
         self.assertEqual(store.pending_workflows.count_documents({}), 2)
+
+    def test_duplicate_buy_now_callback_does_not_double_charge_or_create_order(self):
+        _database, store = self.make_store()
+        store.ensure_user(31)
+        store.set_user_fields(31, {"balance": 100})
+        store.save_inventory(self.inventory_document("9199990009"))
+
+        def process_callback():
+            if not store.claim_purchase_callback(31, 99, 601):
+                return
+            reserved = store.reserve_inventory_item("India", 2024, 100, "Good")
+            self.assertIsNotNone(reserved)
+            phone = reserved["phone"]
+            purchase_key = f"purchase:single:{phone}"
+            self.assertTrue(
+                store.deduct_balance(
+                    31,
+                    100,
+                    event_key=f"{purchase_key}:debit",
+                    event_type="purchase_debit",
+                )
+            )
+            store.create_order(
+                31,
+                "India",
+                2024,
+                100,
+                phone,
+                "12345",
+                purchase_key=purchase_key,
+            )
+
+        process_callback()
+        process_callback()
+
+        self.assertEqual(store.get_balance(31), 0)
+        self.assertEqual(store.orders.count_documents({}), 1)
+        self.assertEqual(store.count_inventory({"available": 0}), 1)
 
     def make_store(self):
         database = FakeDatabase()
