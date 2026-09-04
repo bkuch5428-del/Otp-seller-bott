@@ -454,6 +454,70 @@ class MongoPersistenceTests(unittest.TestCase):
         store.set_setting("usdt_rate", 83.5)
         self.assertEqual(store.get_setting("usdt_rate"), "83.5")
 
+    def test_start_and_buy_account_banners_are_independent_and_persisted(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        store = MongoRuntimeStore(repository)
+
+        store.set_setting("banner_photo", "start-banner-reference")
+        store.set_setting("buy_account_banner_file_id", "buy-account-banner-reference")
+
+        restarted_store = MongoRuntimeStore(MongoRepository(database))
+        self.assertEqual(
+            restarted_store.get_setting("banner_photo"),
+            "start-banner-reference",
+        )
+        self.assertEqual(
+            restarted_store.get_setting("buy_account_banner_file_id"),
+            "buy-account-banner-reference",
+        )
+
+        restarted_store.delete_setting("buy_account_banner_file_id")
+        self.assertIsNone(restarted_store.get_setting("buy_account_banner_file_id"))
+        self.assertEqual(
+            restarted_store.get_setting("banner_photo"),
+            "start-banner-reference",
+        )
+
+    def test_buy_account_banner_display_has_safe_fallback_without_banner(self):
+        source = Path("james.py").read_text(encoding="utf-8")
+        start_banner_start = source.index("def get_banner_media")
+        start_banner_end = source.index("\n\ndef get_banner_reference", start_banner_start)
+        start_banner_helpers = source[start_banner_start:start_banner_end]
+        self.assertIn('get_setting("banner_photo")', start_banner_helpers)
+
+        start_menu_start = source.index("async def send_main_menu")
+        start_menu_end = source.index("\nasync def ", start_menu_start + 10)
+        start_menu = source[start_menu_start:start_menu_end]
+        self.assertIn("get_banner_media()", start_menu)
+        self.assertIn('get_setting("images_enabled", "off") == "on"', start_menu)
+
+        render_start = source.index("async def render_account_store")
+        render_end = source.index("\nasync def show_product_details", render_start)
+        render_account_store = source[render_start:render_end]
+
+        self.assertIn(
+            'BUY_ACCOUNT_BANNER_SETTING = "buy_account_banner_file_id"',
+            source,
+        )
+        self.assertIn(
+            'buy_account_banner = get_buy_account_banner() if flow == "single" else None',
+            render_account_store,
+        )
+        self.assertIn(
+            "if send_banner and buy_account_banner:",
+            render_account_store,
+        )
+        self.assertIn(
+            "await bot.send_file(event.chat_id, buy_account_banner)",
+            render_account_store,
+        )
+        self.assertIn(
+            "await event.respond(caption, buttons=buttons)",
+            render_account_store,
+        )
+
     def test_runtime_store_handles_admins_custom_countries_and_payments(self):
         database = FakeDatabase()
         repository = MongoRepository(database)

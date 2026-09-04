@@ -567,6 +567,11 @@ def get_banner_reference(raw):
     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
         return None
 
+BUY_ACCOUNT_BANNER_SETTING = "buy_account_banner_file_id"
+
+def get_buy_account_banner():
+    return get_banner_reference(get_setting(BUY_ACCOUNT_BANNER_SETTING))
+
 STORE_DEFAULT_MESSAGES = {
     "single": (
         "🛒 <b>ACCOUNT STORE</b>\n━━━━━━━━━━━━━━━━━━\n"
@@ -1322,7 +1327,13 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     buttons.append([Button.inline(get_store_buttons(flow)["back"], "shop_back")])
 
     caption = account_store_caption(products, page, total_pages, page_products, flow)
+    buy_account_banner = get_buy_account_banner() if flow == "single" else None
     banner = get_banner_reference(get_setting(store_banner_key(flow)))
+    if send_banner and buy_account_banner:
+        try:
+            await bot.send_file(event.chat_id, buy_account_banner)
+        except Exception:
+            pass
     if send_banner and banner:
         try:
             await bot.send_file(event.chat_id, banner, caption=caption, buttons=buttons)
@@ -2295,13 +2306,29 @@ async def banner_manager_menu(event):
     enabled = get_setting("images_enabled", "off") == "on"
     status = "🟢 ON" if enabled else "🔴 OFF"
     banner_status = "configured" if get_setting("banner_photo") else "not configured"
+    buy_account_banner_status = (
+        "configured"
+        if get_setting(BUY_ACCOUNT_BANNER_SETTING)
+        else "not configured"
+    )
     btns = [
         [Button.inline("➕ Add/Replace Banner", "adm_banner_add")],
         [Button.inline("🗑️ Delete Banner", "adm_banner_delete"), Button.inline("👁️ Preview Banner", "adm_banner_preview")],
+        [Button.inline("🛒 Buy Account Banner", "adm_buy_account_banner")],
+        [
+            Button.inline("🗑️ Delete Buy Account Banner", "adm_buy_account_banner_delete"),
+            Button.inline("👁️ Preview Buy Account Banner", "adm_buy_account_banner_preview"),
+        ],
         [Button.inline(f"Images {'ON' if enabled else 'OFF'}", "adm_banner_toggle")],
         [Button.inline("◀️ Back", "adm_adminmain")]
     ]
-    await event.edit(f"🖼️ <b>Banner Images</b>\n\nStatus: {status}\nBanner: {banner_status}", buttons=btns)
+    await event.edit(
+        f"🖼️ <b>Banner Images</b>\n\n"
+        f"Status: {status}\n"
+        f"Banner: {banner_status}\n"
+        f"Buy Account Banner: {buy_account_banner_status}",
+        buttons=btns,
+    )
 
 async def store_settings_menu(event, flow):
     name = "Account" if flow == "single" else "Sessions"
@@ -2523,7 +2550,7 @@ async def admin_actions(event):
         await event.answer("User status updated.", alert=True)
         return await render_user_management(event, target_id)
 
-    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "store_messages", "store_buttons"} or action_data.startswith(("store_config|", "store_msg|", "store_preview|", "store_banner", "store_btns|", "store_btn|")):
+    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "buy_account_banner", "buy_account_banner_cancel", "buy_account_banner_delete", "buy_account_banner_preview", "store_messages", "store_buttons"} or action_data.startswith(("store_config|", "store_msg|", "store_preview|", "store_banner", "store_btns|", "store_btn|")):
         if not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
             return await event.answer("Not authorized.", alert=True)
 
@@ -2574,7 +2601,7 @@ async def admin_actions(event):
         admin_content_state[uid] = {"type": "store_button", "flow": parts[1], "key": parts[2]}
         return await event.edit(f"✏️ <b>Send the new label for {parts[2]}.</b>", buttons=[[Button.inline("↩️ Cancel", f"adm_store_btns|{parts[1]}")]])
 
-    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle"} and not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
+    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "buy_account_banner", "buy_account_banner_cancel", "buy_account_banner_delete", "buy_account_banner_preview"} and not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
         return await event.answer("Not authorized.", alert=True)
 
     if action_data == "welcome":
@@ -2615,6 +2642,29 @@ async def admin_actions(event):
         try:
             await bot.send_file(uid, banner)
             return await event.answer("Preview sent.", alert=True)
+        except Exception:
+            return await event.answer("Banner reference expired. Upload it again.", alert=True)
+
+    if action_data == "buy_account_banner":
+        admin_content_state[uid] = "buy_account_banner"
+        return await event.edit(
+            "🛒 <b>Send the Buy Account banner image/photo.</b>",
+            buttons=[[Button.inline("◀️ Cancel", "adm_buy_account_banner_cancel")]],
+        )
+    if action_data == "buy_account_banner_cancel":
+        admin_content_state.pop(uid, None)
+        return await banner_manager_menu(event)
+    if action_data == "buy_account_banner_delete":
+        delete_setting(BUY_ACCOUNT_BANNER_SETTING)
+        await event.answer("Buy Account banner deleted.", alert=True)
+        return await banner_manager_menu(event)
+    if action_data == "buy_account_banner_preview":
+        banner = get_buy_account_banner()
+        if not banner:
+            return await event.answer("No Buy Account banner configured.", alert=True)
+        try:
+            await bot.send_file(uid, banner)
+            return await event.answer("Buy Account banner preview sent.", alert=True)
         except Exception:
             return await event.answer("Banner reference expired. Upload it again.", alert=True)
 
@@ -3211,6 +3261,21 @@ async def handle_all_messages(e):
                 set_setting("banner_photo", json.dumps(reference))
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Banner added/replaced successfully.")
+            if content_type == "buy_account_banner":
+                if not e.photo:
+                    return await e.reply("❌ Please send a Telegram photo.")
+                photo = e.photo
+                reference = {
+                    "id": photo.id,
+                    "access_hash": photo.access_hash,
+                    "file_reference": photo.file_reference.hex()
+                }
+                set_setting(BUY_ACCOUNT_BANNER_SETTING, json.dumps(reference))
+                admin_content_state.pop(uid, None)
+                return await e.reply(
+                    "✅ Buy Account banner added/replaced successfully.",
+                    buttons=[[Button.inline("◀️ Back", "adm_banner")]],
+                )
         if not text: return
 
         if "Buy Account" in text or "Buy Sessions" in text or "Deposit" in text or "My Profile" in text or "My Stats" in text or "Support" in text or "Admin Panel" in text:
