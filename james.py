@@ -1170,7 +1170,9 @@ async def keypad_logic(event):
     """Handle UPI keypad input"""
     uid = event.sender_id
     action = event.data.decode().replace("kp_", "")
-    curr = deposit_input.get(uid, {}).get('val', "0")
+    keypad_state = deposit_input.get(uid, {})
+    keypad_step = keypad_state.get("step", "upi_keypad")
+    curr = keypad_state.get('val', "0")
 
     if action.isdigit():
         if curr == "0": 
@@ -1192,10 +1194,10 @@ async def keypad_logic(event):
         except ValueError:
             return await event.answer("⚠️ Invalid amount", alert=True)
     
-    deposit_input[uid] = {'step': 'upi_keypad', 'val': curr}
+    deposit_input[uid] = {'step': keypad_step, 'val': curr}
     
     try:
-        upi_line = "" if deposit_input.get(uid, {}).get("step") == "automatic_keypad" else f"💳 UPI ID: <code>{UPI_ID}</code>\n\n"
+        upi_line = "" if keypad_step == "automatic_keypad" else f"💳 UPI ID: <code>{UPI_ID}</code>\n\n"
         await event.edit(f"{P_KEY} <b>ENTER AMOUNT IN INR</b>\n\n"
                         f"{upi_line}"
                         f"{P_MONEY} <code>₹{curr}</code>",

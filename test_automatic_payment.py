@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from urllib.parse import parse_qs, urlsplit
-from unittest.mock import patch
+from unittest.mock import ANY, AsyncMock, patch
 
 os.environ.setdefault("API_ID", "1")
 os.environ.setdefault("API_HASH", "test-hash")
@@ -147,6 +147,44 @@ class AutomaticPaymentTests(unittest.TestCase):
         self.assertIn('data.startswith("depm_")', source)
         self.assertIn('data == "dep_upi"', source)
         self.assertIn('if deposit_input.get(uid, {}).get("step") == "automatic_keypad":', source)
+        self.assertIn('keypad_step = keypad_state.get("step", "upi_keypad")', source)
+        self.assertIn("deposit_input[uid] = {'step': keypad_step, 'val': curr}", source)
+        self.assertIn("return await show_automatic_payment_qr(event, amt)", source)
+        self.assertNotIn(
+            "deposit_input[uid] = {'step': 'upi_keypad', 'val': curr}",
+            source,
+        )
+
+    def test_amount_keypad_preserves_automatic_workflow_on_confirm(self):
+        class KeypadEvent:
+            sender_id = 55
+            chat_id = 55
+
+            def __init__(self, action):
+                self.data = action.encode()
+                self.edits = []
+
+            async def edit(self, message, buttons=None):
+                self.edits.append((message, buttons))
+
+            async def answer(self, *args, **kwargs):
+                return None
+
+        async def exercise():
+            james.deposit_input[55] = {"step": "automatic_keypad", "val": "0"}
+            digit_event = KeypadEvent("kp_2")
+            await james.keypad_logic(digit_event)
+            self.assertEqual(james.deposit_input[55], {"step": "automatic_keypad", "val": "2"})
+            with (
+                patch.object(james, "show_automatic_payment_qr", new=AsyncMock()) as automatic_qr,
+                patch.object(james, "show_upi_qr", new=AsyncMock()) as manual_qr,
+            ):
+                await james.keypad_logic(KeypadEvent("kp_done"))
+            automatic_qr.assert_awaited_once()
+            manual_qr.assert_not_awaited()
+            automatic_qr.assert_awaited_once_with(ANY, 2)
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":
