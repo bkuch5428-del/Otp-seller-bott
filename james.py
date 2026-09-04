@@ -36,7 +36,7 @@ from telethon.errors import (
 from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButtonRow, KeyboardButton, InputPhoto
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.functions.account import GetPasswordRequest
-from telethon.sessions import StringSession, SQLiteSession
+from telethon.sessions import StringSession
 from cryptography.fernet import Fernet, InvalidToken
 
 # ================= CONFIGURATION =================
@@ -337,21 +337,74 @@ def get_user_lock(uid):
 def get_inventory_session_string(document):
     return decrypt_session_string(document.get("session_string"))
 
+def export_session_string(client):
+    """Export an authenticated Telethon session without exposing its secret."""
+    source = client.session
+    exported = StringSession()
+    exported.set_dc(source.dc_id, source.server_address, source.port)
+    exported.auth_key = source.auth_key
+    return exported.save() or None
+
 def save_inventory_session(document, client):
-    session_string = client.session.save()
+    session_string = export_session_string(client)
     if not session_string:
         return
     mongo_store.save_inventory({
         **document,
         "session_string": encrypt_session_string(session_string),
+        "session_storage": "encrypted_string_session",
+        "session_migrated_at": datetime.now(timezone.utc).isoformat(),
     })
 
-def restore_session_file(session_string, session_path):
-    parsed = StringSession(session_string)
-    sqlite_session = SQLiteSession(session_path)
-    sqlite_session.set_dc(parsed.dc_id, parsed.server_address, parsed.port)
-    sqlite_session.auth_key = parsed.auth_key
-    sqlite_session.save()
+async def migrate_inventory_sessions():
+    """Copy legacy local sessions into Mongo without changing the local files."""
+    migrated = 0
+    skipped = 0
+    for document in mongo_store.list_inventory({}):
+        if get_inventory_session_string(document):
+            continue
+
+        session_file = document.get("session_file")
+        if not session_file:
+            skipped += 1
+            continue
+        session_path = str(session_file)
+        if not os.path.exists(session_path) and not os.path.exists(f"{session_path}.session"):
+            skipped += 1
+            logger.warning(
+                "Inventory session unavailable for phone=%s; re-login required",
+                document.get("phone"),
+            )
+            continue
+
+        client = None
+        try:
+            client = get_inventory_client(document)
+            await client.connect()
+            if not await client.is_user_authorized():
+                skipped += 1
+                logger.warning(
+                    "Inventory session is not authorized for phone=%s",
+                    document.get("phone"),
+                )
+                continue
+            save_inventory_session(document, client)
+            migrated += 1
+        except Exception:
+            skipped += 1
+            logger.exception(
+                "Could not migrate inventory session for phone=%s",
+                document.get("phone"),
+            )
+        finally:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    logger.exception(
+                        "Could not disconnect inventory migration client for phone=%s",
+                        document.get("phone"),
+                    )
 
 def get_inventory_client(document):
     session_string = get_inventory_session_string(document)
@@ -362,6 +415,15 @@ def get_inventory_client(document):
         API_ID,
         API_HASH,
     )
+
+def persist_bot_session():
+    """Persist the bot's authenticated session while retaining the local fallback."""
+    session_string = export_session_string(bot)
+    if session_string:
+        mongo_store.set_setting(
+            "bot_session_string",
+            encrypt_session_string(session_string),
+        )
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
@@ -3261,11 +3323,17 @@ async def admin_actions(event):
                         pwd = await client(GetPasswordRequest())
                         has_2fa = pwd.has_password
                         year = await detect_account_year(client)
+                        session_string = export_session_string(client)
                         await client.disconnect()
 
                         key = (c_name, year, has_2fa)
                         if key not in groups: groups[key] = []
-                        groups[key].append({"phone": phone, "path": clean_path, "c_icon": c_icon})
+                        groups[key].append({
+                            "phone": phone,
+                            "path": clean_path,
+                            "c_icon": c_icon,
+                            "session_string": session_string,
+                        })
                     except Exception as e: logger.error(f"Scan error: {e}")
 
                 for key in list(groups.keys()):
@@ -3316,6 +3384,9 @@ async def admin_actions(event):
                             "twofa": twofa_pass,
                             "added_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                             "data_center": None,
+                            "session_string": encrypt_session_string(acc["session_string"]),
+                            "session_storage": "encrypted_string_session",
+                            "session_migrated_at": datetime.now(timezone.utc).isoformat(),
                         })
                         added_phones.append(acc['phone'])
                         success += 1
@@ -3384,6 +3455,7 @@ async def admin_actions(event):
                 auto_year = await detect_account_year(client)
                 if year is None:
                     year = auto_year
+                session_string = export_session_string(client)
                 await client.disconnect()
 
                 mongo_store.save_inventory({
@@ -3398,6 +3470,9 @@ async def admin_actions(event):
                     "twofa": twofa_pass,
                     "added_date": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                     "data_center": dc,
+                    "session_string": encrypt_session_string(session_string),
+                    "session_storage": "encrypted_string_session",
+                    "session_migrated_at": datetime.now(timezone.utc).isoformat(),
                 })
                 usd_price = to_usd(price)
                 display = f"{c_icon} {c_name}"
@@ -4087,6 +4162,7 @@ async def handle_callback_query(e):
     except Exception as ex: print(f"Callback Error: {ex}")
 
 async def main():
+    await migrate_inventory_sessions()
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
     app.router.add_get("/", lambda request: web.Response(text="OK"))
@@ -4109,5 +4185,6 @@ async def main():
 
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
+    persist_bot_session()
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
