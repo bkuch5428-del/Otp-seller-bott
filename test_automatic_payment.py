@@ -103,6 +103,50 @@ class AutomaticPaymentTests(unittest.TestCase):
         expired = dict(order, expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
         with patch.object(james.imaplib, "IMAP4_SSL", FakeImap):
             self.assertEqual(james.verify_automatic_payment(expired), "expired")
+        with patch.object(james.imaplib, "IMAP4_SSL", FakeImap):
+            self.assertEqual(james.verify_automatic_payment(dict(order, payment_purpose=None)), "error")
+
+    def test_check_payment_always_shows_pending_or_error_result(self):
+        class CheckEvent:
+            sender_id = 7
+            chat_id = 7
+
+            def __init__(self):
+                self.edits = []
+                self.answers = []
+
+            async def answer(self, message, **kwargs):
+                self.answers.append(message)
+
+            async def edit(self, message, buttons=None):
+                self.edits.append(message)
+
+            async def delete(self):
+                return None
+
+        order = {
+            "order_id": "ORD-PENDING",
+            "user_id": 7,
+            "amount_inr": 20,
+            "payment_purpose": "FAP20260904ABC123",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+            "status": "pending",
+        }
+
+        async def exercise():
+            with patch.object(james.mongo_store, "get_automatic_payment", return_value=order), \
+                    patch.object(james, "verify_automatic_payment", return_value="pending"):
+                event = CheckEvent()
+                await james.check_automatic_payment(event, "ORD-PENDING")
+                self.assertTrue(any("Payment not received yet" in message for message in event.edits))
+
+            with patch.object(james.mongo_store, "get_automatic_payment", return_value=order), \
+                    patch.object(james, "verify_automatic_payment", return_value=None):
+                event = CheckEvent()
+                await james.check_automatic_payment(event, "ORD-PENDING")
+                self.assertTrue(any("verification temporarily failed" in message for message in event.edits))
+
+        asyncio.run(exercise())
 
     def test_mongodb_order_persists_and_credit_is_idempotent(self):
         database = FakeDatabase()

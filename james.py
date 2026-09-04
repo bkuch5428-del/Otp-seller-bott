@@ -1042,6 +1042,9 @@ def verify_automatic_payment(order):
     if not IMAP_USERNAME or not IMAP_APP_PASSWORD:
         logger.error("Automatic payment verification is not configured")
         return "error"
+    if not order.get("amount_inr") or not order.get("payment_purpose"):
+        logger.error("Automatic payment order is missing amount or payment purpose")
+        return "error"
     expiry = datetime.fromisoformat(str(order["expires_at"]))
     if expiry.tzinfo is None:
         expiry = expiry.replace(tzinfo=timezone.utc)
@@ -1317,34 +1320,78 @@ async def show_automatic_payment_qr(event, amount):
         except Exception:
             await bot.send_message(uid, "❌ Could not generate the payment QR. Please try again later.")
 
+async def send_automatic_check_result(event, message, *, order_id=None):
+    buttons = None
+    if order_id:
+        buttons = [
+            [Button.inline("✅ Check Payment", f"automatic_check|{order_id}")],
+            [Button.inline("❌ Cancel", f"automatic_cancel|{order_id}")],
+        ]
+    try:
+        await event.edit(message, buttons=buttons)
+        return True
+    except Exception:
+        logger.exception("Unable to edit automatic payment status order_id=%s", order_id)
+    try:
+        await event.answer(message, alert=True)
+        return True
+    except Exception:
+        logger.exception("Unable to answer automatic payment status order_id=%s", order_id)
+    try:
+        await bot.send_message(event.chat_id, message, buttons=buttons)
+        return True
+    except Exception:
+        logger.exception("Unable to send automatic payment status order_id=%s", order_id)
+        return False
+
 async def check_automatic_payment(event, order_id):
     uid = event.sender_id
-    await event.answer("🔎 Checking payment...", alert=False)
+    try:
+        await event.answer("🔎 Checking payment...", alert=False)
+    except Exception:
+        logger.exception("Unable to acknowledge automatic payment check order_id=%s", order_id)
+    await send_automatic_check_result(event, "⏳ Verifying Payment...", order_id=order_id)
     try:
         order = mongo_store.get_automatic_payment(order_id)
         if not order or int(order.get("user_id")) != int(uid):
-            return await event.answer("❌ Payment order not found.", alert=True)
+            return await send_automatic_check_result(event, "❌ Payment order not found.")
         if order.get("status") == "verified":
-            return await event.answer("✅ Payment already verified.", alert=True)
+            return await send_automatic_check_result(event, "✅ Payment already verified.")
         if order.get("status") == "cancelled":
-            return await event.answer("❌ Payment session was cancelled.", alert=True)
-        expiry = datetime.fromisoformat(str(order["expires_at"]))
+            return await send_automatic_check_result(event, "❌ Payment session was cancelled.")
+        try:
+            expiry = datetime.fromisoformat(str(order["expires_at"]))
+        except (KeyError, TypeError, ValueError):
+            logger.exception("Invalid automatic payment expiry order_id=%s", order_id)
+            return await send_automatic_check_result(
+                event,
+                "⚠️ Payment verification temporarily failed.\n\nPlease try Check Payment again in a moment.",
+                order_id=order_id,
+            )
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
         if datetime.now(timezone.utc) >= expiry:
             mongo_store.update_automatic_payment_status(order_id, "pending", "expired", "expired")
-            return await event.answer("❌ Payment session expired. Please create a new payment order.", alert=True)
+            return await send_automatic_check_result(event, "⌛ Payment session expired.\n\nPlease start a new Automatic Payment.")
 
         result = await asyncio.to_thread(verify_automatic_payment, order)
         if result == "pending":
             mongo_store.update_automatic_payment_status(order_id, "pending", "pending", "not_found")
-            return await event.answer("⏳ Payment Not Received Yet.\n\nIf you have already paid, contact admin.", alert=True)
+            return await send_automatic_check_result(
+                event,
+                "❌ Payment not received yet.\n\nIf you have already paid, please contact admin.",
+                order_id=order_id,
+            )
         if result == "expired":
             mongo_store.update_automatic_payment_status(order_id, "pending", "expired", "expired")
-            return await event.answer("❌ Payment session expired. Please create a new payment order.", alert=True)
+            return await send_automatic_check_result(event, "⌛ Payment session expired.\n\nPlease start a new Automatic Payment.")
         if result != "success":
             mongo_store.update_automatic_payment_status(order_id, "pending", "pending", "verification_error")
-            return await event.answer("⚠️ Payment verification is temporarily unavailable. Please try again.", alert=True)
+            return await send_automatic_check_result(
+                event,
+                "⚠️ Payment verification temporarily failed.\n\nPlease try Check Payment again in a moment.",
+                order_id=order_id,
+            )
 
         amount = int(order["amount_inr"])
         previous_balance = mongo_store.get_balance(uid)
@@ -1365,9 +1412,19 @@ async def check_automatic_payment(event, order_id):
             datetime.now(timezone.utc).isoformat(),
         )
         if credit.get("already_applied"):
-            return await event.answer("✅ Payment already verified.", alert=True)
+            mongo_store.update_automatic_payment_status(
+                order_id,
+                "pending",
+                "verified",
+                "verified",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            return await send_automatic_check_result(event, "✅ Payment already verified.")
         new_balance = credit.get("balance", previous_balance + amount)
-        await event.delete()
+        try:
+            await event.delete()
+        except Exception:
+            logger.exception("Unable to delete automatic payment screen order_id=%s", order_id)
         await bot.send_message(uid, f"✅ Payment Successful! ₹{amount} added to your wallet.")
         await bot.send_message(
             uid,
@@ -1378,7 +1435,11 @@ async def check_automatic_payment(event, order_id):
         )
     except Exception:
         logger.exception("Automatic payment check failed uid=%s order_id=%s", uid, order_id)
-        await event.answer("⚠️ Payment verification is temporarily unavailable. Please try again.", alert=True)
+        await send_automatic_check_result(
+            event,
+            "⚠️ Payment verification temporarily failed.\n\nPlease try Check Payment again in a moment.",
+            order_id=order_id,
+        )
 
 async def cancel_automatic_payment(event, order_id):
     uid = event.sender_id
