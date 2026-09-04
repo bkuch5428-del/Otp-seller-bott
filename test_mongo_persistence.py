@@ -546,7 +546,6 @@ class MongoPersistenceTests(unittest.TestCase):
             deposit_handler,
         )
         self.assertIn('"dep_upi"', deposit_handler)
-        self.assertIn('"depm_Cwallet"', deposit_handler)
         self.assertIn("await bot.send_message(event.chat_id, msg, buttons=btns)", deposit_handler)
 
         profile_start = source.index("async def profile_handler")
@@ -729,7 +728,7 @@ class MongoPersistenceTests(unittest.TestCase):
             screenshot="screenshots/a.jpg",
             utr="UTR12345678",
         )
-        second = store.create_deposit(25, 200, "Cwallet")
+        second = store.create_deposit(25, 200, "Manual")
 
         self.assertEqual(first["_id"], 41)
         self.assertEqual(second["_id"], 42)

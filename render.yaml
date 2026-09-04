@@ -29,10 +29,6 @@ services:
         sync: false
       - key: UPI_QR
         sync: false
-      - key: CWALLET_QR
-        sync: false
-      - key: CWALLET_ID
-        sync: false
       - key: SUPPORT_USERNAME_1
         sync: false
       - key: SUPPORT_USERNAME_2

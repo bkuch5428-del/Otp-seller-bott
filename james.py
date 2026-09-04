@@ -92,10 +92,6 @@ TERMS_URL = os.getenv(
 UPI_ID = os.getenv("UPI_ID", "bobbyahirwar@fam")
 UPI_QR = os.getenv("UPI_QR", "https://files.catbox.moe/m5c01u.jpg")
 
-# ========== CWALLET DETAILS ==========
-CWALLET_QR = os.getenv("CWALLET_QR", "https://files.catbox.moe/m5c01u.jpg")
-CWALLET_ID = os.getenv("CWALLET_ID", "your_cwallet_id_here")
-
 # ========== SUPPORT CONTACTS ==========
 SUPPORT_USERNAME_1 = os.getenv("SUPPORT_USERNAME_1", "Your_cuteexd")
 SUPPORT_USERNAME_2 = os.getenv("SUPPORT_USERNAME_2", "Know_Your_Papa")
@@ -946,19 +942,18 @@ def format_payment_buttons(buttons):
 async def deposit_menu(event):
     msg = (f"{P_CARD} <b>Select Payment Method:</b>\n\n"
            f"{PE_LIGHTNING} Choose Automatic for instant credit.\n"
-           f"{P_WAIT} Choose Manual for other methods.\n"
-           f"{PE_GIFT} Cwallet gives <b>+5% bonus</b>!")
+           f"{P_WAIT} Choose Manual for other methods.")
     
     flat_buttons = [
         Button.inline("🏦 Manual Payment", "dep_upi"),
-        Button.inline(f"👛 Cwallet (+5%)", "depm_Cwallet")
+        Button.inline("⚡ Automatic Payment", "automatic_payment")
     ]
     
     customs = mongo_store.list_custom_payments()
     for payment in customs:
+        if str(payment.get("name", "")).strip().casefold() == "cwallet":
+            continue
         flat_buttons.append(Button.inline(f"💳 {payment['name']}", f"depm_{payment['name']}"))
-    flat_buttons.append(Button.inline("⚡ Automatic Payment", "automatic_payment"))
-    
     btns = format_payment_buttons(flat_buttons)
     btns.append([Button.inline("❌ Cancel", "cancel_action")])
     if await send_bannered_message(event, DEPOSIT_BANNER_SETTING, msg, btns):
@@ -1113,27 +1108,11 @@ def get_admin_custom_keypad(dep_id):
 async def manual_deposit_init(event, method):
     uid = event.sender_id
     deposit_input[uid] = {'step': 'wait_amt', 'method': method}
-    
-    if method == "Cwallet":
-        caption = (f"{P_CARD} <b>Cwallet Deposit</b>\n\n"
-                   f"👇 <b>Scan QR to pay via Cwallet</b>\n\n"
-                   f"💳 <b>Cwallet ID:</b> <code>{CWALLET_ID}</code>\n\n"
-                   f"💰 <b>Enter the AMOUNT</b> in ₹ (INR) you want to deposit.\n\n"
-                   f"{PE_GIFT} <b>Bonus:</b> You will get <b>+5% extra</b> on Cwallet deposits!\n\n"
-                   f"<i>After payment, send the screenshot/proof here.</i>")
-        
-        await event.delete()
-        
-        try:
-            await bot.send_file(uid, CWALLET_QR, caption=caption, buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
-        except Exception as e:
-            await bot.send_message(uid, caption, buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
-    else:
-        await event.edit(
-            f"{P_CARD} <b>{method} Deposit</b>\n\n"
-            f"👇 Reply to this message with the <b>AMOUNT</b> in ₹ (INR) you want to deposit.",
-            buttons=[[Button.inline("❌ Cancel", "cancel_action")]]
-        )
+    await event.edit(
+        f"{P_CARD} <b>{method} Deposit</b>\n\n"
+        f"👇 Reply to this message with the <b>AMOUNT</b> in ₹ (INR) you want to deposit.",
+        buttons=[[Button.inline("❌ Cancel", "cancel_action")]]
+    )
 
 # ========== UPI FUNCTIONS WITH SCREENSHOT ==========
 
@@ -3494,7 +3473,6 @@ async def handle_all_messages(e):
         if uid in waiting_proof and (e.photo or (e.text and "http" in e.text)):
             info = waiting_proof.pop(uid)
             final_amt = info['amount']
-            if info['method'] == "Cwallet": final_amt = int(final_amt * 1.05)
             
             screenshot_path = None
             if e.photo:
@@ -3694,51 +3672,27 @@ async def handle_all_messages(e):
                 amt = int(re.sub(r'[^\d]', '', text))
                 if amt < 10: return await e.reply(f"{P_WARN} Minimum Deposit is ₹10.")
                 method = deposit_input[uid]['method']
+
+                waiting_proof[uid] = {'amount': amt, 'method': method}
+                deposit_input.pop(uid)
+
+                rate = get_usdt_rate()
+                usdt_amt = round(amt / rate, 2)
+                rate_text = f"\n\n{P_MONEY} <b>Amount to Pay:</b> {P_INR}{amt} (~{P_USDT}{usdt_amt} USDT)\n💱 <i>Exchange Rate: {P_INR}{rate} = $1</i>"
                 
-                if method == "Cwallet":
-                    final_amt = int(amt * 1.05)
-                    waiting_proof[uid] = {
-                        'amount': amt,
-                        'method': method,
-                        'final_amount': final_amt
-                    }
-                    deposit_input.pop(uid)
-                    
-                    caption = (f"{P_CARD} <b>Cwallet Deposit</b>\n\n"
-                               f"{P_MONEY} <b>Amount:</b> ₹{amt}\n"
-                               f"{PE_GIFT} <b>Bonus (5%):</b> ₹{final_amt - amt}\n"
-                               f"{P_MONEY} <b>Total Credit:</b> ₹{final_amt}\n\n"
-                               f"👇 <b>Scan QR to pay via Cwallet</b>\n"
-                               f"💳 <b>Cwallet ID:</b> <code>{CWALLET_ID}</code>\n\n"
-                               f"<i>After payment, send the screenshot/proof here.</i>")
-                    
-                    try:
-                        await bot.send_file(uid, CWALLET_QR, caption=caption, buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
-                    except Exception as err:
-                        await bot.send_message(uid, caption, buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
-                    return
+                if method == "UPI":
+                    return await show_upi_qr(event, amt)
+                payment = mongo_store.get_custom_payment(method)
+                if payment:
+                    cap = payment.get("caption", "") + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
+                    btns = [[Button.inline("❌ Cancel", "cancel_action")]]
+                    qr_file_id = payment.get("qr_file_id")
+                    if qr_file_id and os.path.exists(qr_file_id):
+                        try: await bot.send_file(e.chat_id, qr_file_id, caption=cap, buttons=btns)
+                        except: await e.reply(cap, buttons=btns)
+                    else: await e.reply(cap, buttons=btns)
                 else:
-                    waiting_proof[uid] = {'amount': amt, 'method': method}
-                    deposit_input.pop(uid)
-                    
-                    rate = get_usdt_rate()
-                    usdt_amt = round(amt / rate, 2)
-                    rate_text = f"\n\n{P_MONEY} <b>Amount to Pay:</b> {P_INR}{amt} (~{P_USDT}{usdt_amt} USDT)\n💱 <i>Exchange Rate: {P_INR}{rate} = $1</i>"
-                    
-                    if method == "UPI":
-                        return await show_upi_qr(event, amt)
-                    else:
-                        payment = mongo_store.get_custom_payment(method)
-                        if payment:
-                            cap = payment.get("caption", "") + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
-                            btns = [[Button.inline("❌ Cancel", "cancel_action")]]
-                            qr_file_id = payment.get("qr_file_id")
-                            if qr_file_id and os.path.exists(qr_file_id):
-                                try: await bot.send_file(e.chat_id, qr_file_id, caption=cap, buttons=btns)
-                                except: await e.reply(cap, buttons=btns)
-                            else: await e.reply(cap, buttons=btns)
-                        else: 
-                            await e.reply(f"{P_CARD} <b>{method} Deposit</b>{rate_text}\n\n👇 Send Screenshot here:", buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
+                    await e.reply(f"{P_CARD} <b>{method} Deposit</b>{rate_text}\n\n👇 Send Screenshot here:", buttons=[[Button.inline("❌ Cancel", "cancel_action")]])
             except ValueError: 
                 await e.respond(f"{P_NO} Please enter a valid number in {P_INR} (INR).")
             return
@@ -3932,7 +3886,11 @@ async def handle_callback_query(e):
             if len(parts) != 2 or not parts[1]:
                 return await e.answer("❌ Invalid payment order.", alert=True)
             await cancel_automatic_payment(e, parts[1])
-        elif data.startswith("depm_"): await manual_deposit_init(e, data.replace("depm_", ""))
+        elif data.startswith("depm_"):
+            method = data.replace("depm_", "", 1)
+            if method.strip().casefold() == "cwallet":
+                return await e.answer("This payment method is no longer available.", alert=True)
+            await manual_deposit_init(e, method)
         elif data == "dep_upi": await init_upi_keypad(e)
         elif data == "upload_payment_screenshot":
             if uid not in waiting_proof and uid in pending_utr:
