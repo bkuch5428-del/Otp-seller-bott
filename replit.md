@@ -10,11 +10,11 @@ Set the environment variables listed in `.env.example` in Replit Secrets or
 environment variables before starting the workflow. The same command is used
 as the Render background-worker start command.
 
-The bot keeps its existing SQLite database file, session files, and screenshots
-directories unchanged. MongoDB is required at startup and is used for users,
+The bot keeps its session files and screenshots directories unchanged. MongoDB
+is required at startup and is used for users,
 settings, admin permissions, custom countries, custom payment definitions,
 inventory, auto prices, user balances, deposits, UPI orders, and runtime orders.
-The SQLite file remains available for the staged migration and legacy data only.
+SQLite is used only by the explicit migration utility for legacy data.
 
 ## Required environment variable names
 

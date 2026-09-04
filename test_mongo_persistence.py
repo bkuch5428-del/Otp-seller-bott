@@ -480,6 +480,13 @@ class MongoPersistenceTests(unittest.TestCase):
             "start-banner-reference",
         )
 
+    def test_bot_runtime_does_not_initialize_sqlite(self):
+        source = Path("james.py").read_text(encoding="utf-8")
+        self.assertNotIn("import sqlite3", source)
+        self.assertNotIn('sqlite3.connect("otp_bot_final.db"', source)
+        self.assertNotIn("def setup_db", source)
+        self.assertNotIn("CREATE TABLE IF NOT EXISTS", source)
+
     def test_buy_account_banner_display_has_safe_fallback_without_banner(self):
         source = Path("james.py").read_text(encoding="utf-8")
         start_banner_start = source.index("def get_banner_media")

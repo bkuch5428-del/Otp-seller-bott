@@ -86,6 +86,8 @@ COLLECTION_DEFINITIONS = {
         managed_fields=(
             "phone",
             "session_file",
+            "session_string",
+            "session_string",
             "country_name",
             "country_icon",
             "account_year",

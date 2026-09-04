@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import re
 import asyncio
 import time
@@ -16,6 +15,7 @@ import shutil
 import html
 import json
 import hashlib
+import base64
 from datetime import datetime, timedelta, timezone
 from email import policy
 from email.utils import parsedate_to_datetime
@@ -36,6 +36,8 @@ from telethon.errors import (
 from telethon.tl.types import ReplyKeyboardMarkup, KeyboardButtonRow, KeyboardButton, InputPhoto
 from telethon.tl.functions.channels import GetParticipantRequest
 from telethon.tl.functions.account import GetPasswordRequest
+from telethon.sessions import StringSession, SQLiteSession
+from cryptography.fernet import Fernet, InvalidToken
 
 # ================= CONFIGURATION =================
 def load_env_file(path=".env"):
@@ -68,6 +70,25 @@ def env_int(name, default=0):
 def env_list(name, default_csv=""):
     raw = os.getenv(name, default_csv)
     return [item.strip() for item in raw.split(",") if item.strip()]
+
+def get_session_cipher():
+    seed = SESSION_ENCRYPTION_KEY or f"{BOT_TOKEN}:{API_HASH}:telethon-sessions"
+    key = base64.urlsafe_b64encode(hashlib.sha256(seed.encode()).digest())
+    return Fernet(key)
+
+def encrypt_session_string(session_string):
+    if not session_string:
+        return None
+    return get_session_cipher().encrypt(session_string.encode()).decode()
+
+def decrypt_session_string(value):
+    if not value:
+        return None
+    try:
+        return get_session_cipher().decrypt(str(value).encode()).decode()
+    except (InvalidToken, TypeError, ValueError):
+        logger.warning("Stored Telegram session could not be decrypted")
+        return None
 
 API_ID = env_int("API_ID")
 API_HASH = os.getenv("API_HASH", "")
@@ -112,6 +133,7 @@ IMAP_SENDER_FILTER = os.getenv("IMAP_SENDER_FILTER", "no-reply@famapp.in").strip
 IMAP_LOOKBACK_HOURS = env_int("IMAP_LOOKBACK_HOURS", env_int("GMAIL_LOOKBACK_HOURS", 24))
 AUTOMATIC_PAYMENT_EXPIRY_MINUTES = env_int("AUTOMATIC_PAYMENT_EXPIRY_MINUTES", 10)
 FAMAPP_PURPOSE_PREFIX = os.getenv("FAMAPP_PURPOSE_PREFIX", "FAP").strip().upper() or "FAP"
+SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
 
 # ================= PREMIUM EMOJIS =================
 USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -286,12 +308,9 @@ os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
 
 session_name = f"bot_session_{BOT_TOKEN.split(':')[0]}"
-bot = TelegramClient(session_name, API_ID, API_HASH)
+stored_bot_session = decrypt_session_string(mongo_store.get_setting("bot_session_string"))
+bot = TelegramClient(StringSession(stored_bot_session) if stored_bot_session else session_name, API_ID, API_HASH)
 bot.parse_mode = 'html'
-
-db = sqlite3.connect("otp_bot_final.db", check_same_thread=False, timeout=20)
-db.execute("PRAGMA journal_mode=WAL;")
-cur = db.cursor()
 
 active_orders = {}      
 waiting_proof = {}      
@@ -315,113 +334,34 @@ def get_user_lock(uid):
         user_locks[uid] = asyncio.Lock()
     return user_locks[uid]
 
-# ================= DATABASE SCHEMA =================
-def setup_db():
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        balance INTEGER DEFAULT 0,
-        referred_by INTEGER,
-        total_deposited INTEGER DEFAULT 0,
-        joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        banned INTEGER DEFAULT 0,
-        discount INTEGER DEFAULT 0,
-        terms_accepted INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-    CREATE TABLE IF NOT EXISTS stock (
-        phone TEXT PRIMARY KEY,
-        session_file TEXT,
-        country_name TEXT,
-        country_icon TEXT DEFAULT '🌍',
-        account_year INTEGER,
-        category TEXT DEFAULT 'Good',
-        price INTEGER,
-        available INTEGER DEFAULT 1,
-        twofa TEXT DEFAULT 'None',
-        added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS auto_prices (
-        country TEXT,
-        year TEXT,
-        price INTEGER,
-        PRIMARY KEY (country, year)
-    );
-    CREATE TABLE IF NOT EXISTS deposits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        amount INTEGER,
-        method_name TEXT,
-        status TEXT, 
-        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        screenshot TEXT,
-        utr TEXT
-    );
-    CREATE TABLE IF NOT EXISTS upi_orders (
-        order_id TEXT PRIMARY KEY,
-        user_id INTEGER,
-        amount INTEGER,
-        status TEXT,
-        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        country TEXT,
-        year INTEGER,
-        price INTEGER,
-        phone TEXT,
-        otp TEXT,
-        date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE TABLE IF NOT EXISTS custom_payments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        caption TEXT,
-        qr_file_id TEXT
-    );
-    CREATE TABLE IF NOT EXISTS admins (
-        user_id INTEGER PRIMARY KEY,
-        p_add_stock INTEGER DEFAULT 0,
-        p_manage_stock INTEGER DEFAULT 0,
-        p_stats INTEGER DEFAULT 0,
-        p_bal INTEGER DEFAULT 0,
-        p_settings INTEGER DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS custom_countries (
-        code TEXT PRIMARY KEY,
-        name TEXT,
-        flag TEXT
-    );
-    """)
-    db.commit()
+def get_inventory_session_string(document):
+    return decrypt_session_string(document.get("session_string"))
 
-# ========== FIX: Update existing database ==========
-def update_database_schema():
-    """Add missing columns to deposits table"""
-    try:
-        cur.execute("ALTER TABLE deposits ADD COLUMN screenshot TEXT")
-        db.commit()
-        logger.info("✅ Added screenshot column to deposits")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    
-    try:
-        cur.execute("ALTER TABLE deposits ADD COLUMN utr TEXT")
-        db.commit()
-        logger.info("✅ Added utr column to deposits")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+def save_inventory_session(document, client):
+    session_string = client.session.save()
+    if not session_string:
+        return
+    mongo_store.save_inventory({
+        **document,
+        "session_string": encrypt_session_string(session_string),
+    })
 
-    try:
-        cur.execute("ALTER TABLE stock ADD COLUMN data_center TEXT")
-        db.commit()
-        logger.info("✅ Added data_center column to stock")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
+def restore_session_file(session_string, session_path):
+    parsed = StringSession(session_string)
+    sqlite_session = SQLiteSession(session_path)
+    sqlite_session.set_dc(parsed.dc_id, parsed.server_address, parsed.port)
+    sqlite_session.auth_key = parsed.auth_key
+    sqlite_session.save()
 
-setup_db()
-update_database_schema()
+def get_inventory_client(document):
+    session_string = get_inventory_session_string(document)
+    if session_string:
+        return TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    return TelegramClient(
+        document.get("session_file", "").removesuffix(".session"),
+        API_ID,
+        API_HASH,
+    )
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
@@ -1899,7 +1839,7 @@ async def _process_purchase(
     try:
         await event.edit(f"{PE_LIGHTNING} <b>Fetching Number (+{phone})...</b>")
         clean_sess = sess if not sess.endswith(".session") else sess[:-8]
-        client = TelegramClient(clean_sess, API_ID, API_HASH)
+        client = get_inventory_client(reserved)
     except Exception:
         async with get_user_lock(uid):
             rollback_single_purchase(
@@ -3310,7 +3250,7 @@ async def admin_actions(event):
                     sess_path = os.path.join(extracted_dir, file)
                     clean_path = sess_path[:-8]
                     try:
-                        client = TelegramClient(clean_path, API_ID, API_HASH)
+                        client = get_inventory_client({"session_file": clean_path + ".session"})
                         await client.connect()
                         if not await client.is_user_authorized(): await client.disconnect(); continue
                         me = await client.get_me()
