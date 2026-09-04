@@ -568,9 +568,27 @@ def get_banner_reference(raw):
         return None
 
 BUY_ACCOUNT_BANNER_SETTING = "buy_account_banner_file_id"
+MY_STATS_BANNER_SETTING = "my_stats_banner_file_id"
+MY_PROFILE_BANNER_SETTING = "my_profile_banner_file_id"
+DEPOSIT_BANNER_SETTING = "deposit_banner_file_id"
 
 def get_buy_account_banner():
     return get_banner_reference(get_setting(BUY_ACCOUNT_BANNER_SETTING))
+
+async def send_bannered_message(event, setting, message, buttons=None):
+    banner = get_banner_reference(get_setting(setting))
+    if not banner or len(message) > 1024:
+        return False
+    try:
+        await bot.send_file(event.chat_id, banner, caption=message, buttons=buttons)
+        if isinstance(event, events.CallbackQuery.Event):
+            try:
+                await event.delete()
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
 
 STORE_DEFAULT_MESSAGES = {
     "single": (
@@ -921,6 +939,8 @@ async def deposit_menu(event):
         flat_buttons.append(Button.inline(f"💳 {payment['name']}", f"depm_{payment['name']}"))
     
     btns = format_payment_buttons(flat_buttons)
+    if await send_bannered_message(event, DEPOSIT_BANNER_SETTING, msg, btns):
+        return
     await bot.send_message(event.chat_id, msg, buttons=btns)
 
 def get_keypad():
@@ -1801,6 +1821,8 @@ async def profile_handler(event):
            f"{P_CAL} Joined: {date[:10]}\n\n"
            f"{ref_block}"
            f"<i>(Share this link with your friends to earn bonuses!)</i>")
+    if await send_bannered_message(event, MY_PROFILE_BANNER_SETTING, msg):
+        return
     await bot.send_message(event.chat_id, msg)
 
 async def stats_handler(event, is_callback=False):
@@ -1821,9 +1843,14 @@ async def stats_handler(event, is_callback=False):
     
     btns = [[Button.inline("View Purchase Logs", "page_purchases_1")], [Button.inline("Referral Logs", "view_referrals")]]
     if is_callback:
+        if await send_bannered_message(event, MY_STATS_BANNER_SETTING, msg, btns):
+            return
         try: await event.edit(msg, buttons=btns)
         except MessageNotModifiedError: pass
-    else: await bot.send_message(event.chat_id, msg, buttons=btns)
+    else:
+        if await send_bannered_message(event, MY_STATS_BANNER_SETTING, msg, btns):
+            return
+        await bot.send_message(event.chat_id, msg, buttons=btns)
 
 async def send_purchase_page(event, uid, page):
     limit = 5
@@ -2313,6 +2340,9 @@ async def banner_manager_menu(event):
         if get_setting(BUY_ACCOUNT_BANNER_SETTING)
         else "not configured"
     )
+    my_stats_banner_status = "configured" if get_setting(MY_STATS_BANNER_SETTING) else "not configured"
+    my_profile_banner_status = "configured" if get_setting(MY_PROFILE_BANNER_SETTING) else "not configured"
+    deposit_banner_status = "configured" if get_setting(DEPOSIT_BANNER_SETTING) else "not configured"
     btns = [
         [Button.inline("➕ Add/Replace Banner", "adm_banner_add")],
         [Button.inline("🗑️ Delete Banner", "adm_banner_delete"), Button.inline("👁️ Preview Banner", "adm_banner_preview")],
@@ -2321,6 +2351,12 @@ async def banner_manager_menu(event):
             Button.inline("🗑️ Delete Buy Account Banner", "adm_buy_account_banner_delete"),
             Button.inline("👁️ Preview Buy Account Banner", "adm_buy_account_banner_preview"),
         ],
+        [Button.inline("📊 My Stats Banner", "adm_my_stats_banner")],
+        [Button.inline("🗑️ Delete My Stats Banner", "adm_my_stats_banner_delete"), Button.inline("👁️ Preview My Stats Banner", "adm_my_stats_banner_preview")],
+        [Button.inline("👤 My Profile Banner", "adm_my_profile_banner")],
+        [Button.inline("🗑️ Delete My Profile Banner", "adm_my_profile_banner_delete"), Button.inline("👁️ Preview My Profile Banner", "adm_my_profile_banner_preview")],
+        [Button.inline("💳 Deposit Banner", "adm_deposit_banner")],
+        [Button.inline("🗑️ Delete Deposit Banner", "adm_deposit_banner_delete"), Button.inline("👁️ Preview Deposit Banner", "adm_deposit_banner_preview")],
         [Button.inline(f"Images {'ON' if enabled else 'OFF'}", "adm_banner_toggle")],
         [Button.inline("◀️ Back", "adm_adminmain")]
     ]
@@ -2328,7 +2364,10 @@ async def banner_manager_menu(event):
         f"🖼️ <b>Banner Images</b>\n\n"
         f"Status: {status}\n"
         f"Banner: {banner_status}\n"
-        f"Buy Account Banner: {buy_account_banner_status}",
+        f"Buy Account Banner: {buy_account_banner_status}\n"
+        f"My Stats Banner: {my_stats_banner_status}\n"
+        f"My Profile Banner: {my_profile_banner_status}\n"
+        f"Deposit Banner: {deposit_banner_status}",
         buttons=btns,
     )
 
@@ -2552,7 +2591,7 @@ async def admin_actions(event):
         await event.answer("User status updated.", alert=True)
         return await render_user_management(event, target_id)
 
-    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "buy_account_banner", "buy_account_banner_cancel", "buy_account_banner_delete", "buy_account_banner_preview", "store_messages", "store_buttons"} or action_data.startswith(("store_config|", "store_msg|", "store_preview|", "store_banner", "store_btns|", "store_btn|")):
+    if action_data in {"welcome", "welcome_edit", "welcome_cancel", "welcome_preview", "welcome_reset", "banner", "banner_add", "banner_cancel", "banner_delete", "banner_preview", "banner_toggle", "buy_account_banner", "buy_account_banner_cancel", "buy_account_banner_delete", "buy_account_banner_preview", "my_stats_banner", "my_stats_banner_cancel", "my_stats_banner_delete", "my_stats_banner_preview", "my_profile_banner", "my_profile_banner_cancel", "my_profile_banner_delete", "my_profile_banner_preview", "deposit_banner", "deposit_banner_cancel", "deposit_banner_delete", "deposit_banner_preview", "store_messages", "store_buttons"} or action_data.startswith(("store_config|", "store_msg|", "store_preview|", "store_banner", "store_btns|", "store_btn|")):
         if not (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
             return await event.answer("Not authorized.", alert=True)
 
@@ -2667,6 +2706,37 @@ async def admin_actions(event):
         try:
             await bot.send_file(uid, banner)
             return await event.answer("Buy Account banner preview sent.", alert=True)
+        except Exception:
+            return await event.answer("Banner reference expired. Upload it again.", alert=True)
+
+    banner_actions = {
+        "my_stats_banner": (MY_STATS_BANNER_SETTING, "📊 My Stats"),
+        "my_profile_banner": (MY_PROFILE_BANNER_SETTING, "👤 My Profile"),
+        "deposit_banner": (DEPOSIT_BANNER_SETTING, "💳 Deposit"),
+    }
+    if action_data in banner_actions:
+        setting, label = banner_actions[action_data]
+        admin_content_state[uid] = action_data
+        return await event.edit(
+            f"{label} banner image/photo.",
+            buttons=[[Button.inline("◀️ Cancel", f"adm_{action_data}_cancel")]],
+        )
+    if action_data.endswith("_cancel") and action_data[:-7] in banner_actions:
+        admin_content_state.pop(uid, None)
+        return await banner_manager_menu(event)
+    if action_data.endswith("_delete") and action_data[:-7] in banner_actions:
+        setting, label = banner_actions[action_data[:-7]]
+        delete_setting(setting)
+        await event.answer(f"{label} banner deleted.", alert=True)
+        return await banner_manager_menu(event)
+    if action_data.endswith("_preview") and action_data[:-8] in banner_actions:
+        setting, label = banner_actions[action_data[:-8]]
+        banner = get_banner_reference(get_setting(setting))
+        if not banner:
+            return await event.answer(f"No {label} banner configured.", alert=True)
+        try:
+            await bot.send_file(uid, banner)
+            return await event.answer("Preview sent.", alert=True)
         except Exception:
             return await event.answer("Banner reference expired. Upload it again.", alert=True)
 
@@ -3276,6 +3346,27 @@ async def handle_all_messages(e):
                 admin_content_state.pop(uid, None)
                 return await e.reply(
                     "✅ Buy Account banner added/replaced successfully.",
+                    buttons=[[Button.inline("◀️ Back", "adm_banner")]],
+                )
+            banner_uploads = {
+                "my_stats_banner": (MY_STATS_BANNER_SETTING, "My Stats"),
+                "my_profile_banner": (MY_PROFILE_BANNER_SETTING, "My Profile"),
+                "deposit_banner": (DEPOSIT_BANNER_SETTING, "Deposit"),
+            }
+            if content_type in banner_uploads:
+                if not e.photo:
+                    return await e.reply("❌ Please send a Telegram photo.")
+                setting, label = banner_uploads[content_type]
+                photo = e.photo
+                reference = {
+                    "id": photo.id,
+                    "access_hash": photo.access_hash,
+                    "file_reference": photo.file_reference.hex()
+                }
+                set_setting(setting, json.dumps(reference))
+                admin_content_state.pop(uid, None)
+                return await e.reply(
+                    f"✅ {label} banner added/replaced successfully.",
                     buttons=[[Button.inline("◀️ Back", "adm_banner")]],
                 )
         if not text: return

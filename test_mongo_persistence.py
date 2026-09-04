@@ -523,6 +523,86 @@ class MongoPersistenceTests(unittest.TestCase):
             render_account_store,
         )
 
+    def test_stats_profile_and_deposit_banners_are_composed_with_existing_ui(self):
+        source = Path("james.py").read_text(encoding="utf-8")
+
+        for setting in (
+            'MY_STATS_BANNER_SETTING = "my_stats_banner_file_id"',
+            'MY_PROFILE_BANNER_SETTING = "my_profile_banner_file_id"',
+            'DEPOSIT_BANNER_SETTING = "deposit_banner_file_id"',
+        ):
+            self.assertIn(setting, source)
+        self.assertIn(
+            "await bot.send_file(event.chat_id, banner, caption=message, buttons=buttons)",
+            source,
+        )
+        self.assertIn("if not banner or len(message) > 1024:", source)
+
+        deposit_start = source.index("async def deposit_menu")
+        deposit_end = source.index("\ndef get_keypad", deposit_start)
+        deposit_handler = source[deposit_start:deposit_end]
+        self.assertIn(
+            "send_bannered_message(event, DEPOSIT_BANNER_SETTING, msg, btns)",
+            deposit_handler,
+        )
+        self.assertIn('"dep_upi"', deposit_handler)
+        self.assertIn('"depm_Cwallet"', deposit_handler)
+        self.assertIn("await bot.send_message(event.chat_id, msg, buttons=btns)", deposit_handler)
+
+        profile_start = source.index("async def profile_handler")
+        profile_end = source.index("\nasync def stats_handler", profile_start)
+        profile_handler = source[profile_start:profile_end]
+        self.assertIn(
+            "send_bannered_message(event, MY_PROFILE_BANNER_SETTING, msg)",
+            profile_handler,
+        )
+        self.assertIn("await bot.send_message(event.chat_id, msg)", profile_handler)
+
+        stats_start = source.index("async def stats_handler")
+        stats_end = source.index("\nasync def send_purchase_page", stats_start)
+        stats_handler = source[stats_start:stats_end]
+        self.assertIn(
+            "send_bannered_message(event, MY_STATS_BANNER_SETTING, msg, btns)",
+            stats_handler,
+        )
+        self.assertIn('"page_purchases_1"', stats_handler)
+        self.assertIn('"view_referrals"', stats_handler)
+        self.assertIn("await event.edit(msg, buttons=btns)", stats_handler)
+
+        banner_menu_start = source.index("async def banner_manager_menu")
+        banner_menu_end = source.index("\nasync def store_settings_menu", banner_menu_start)
+        banner_menu = source[banner_menu_start:banner_menu_end]
+        for label in ("My Stats Banner", "My Profile Banner", "Deposit Banner"):
+            self.assertIn(label, banner_menu)
+
+    def test_all_banner_settings_are_independent_and_persisted(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        store = MongoRuntimeStore(repository)
+        settings = {
+            "banner_photo": "start-banner-reference",
+            "buy_account_banner_file_id": "buy-account-banner-reference",
+            "my_stats_banner_file_id": "stats-banner-reference",
+            "my_profile_banner_file_id": "profile-banner-reference",
+            "deposit_banner_file_id": "deposit-banner-reference",
+        }
+        for key, value in settings.items():
+            store.set_setting(key, value)
+
+        restarted_store = MongoRuntimeStore(MongoRepository(database))
+        for key, value in settings.items():
+            self.assertEqual(restarted_store.get_setting(key), value)
+
+        restarted_store.set_setting("my_stats_banner_file_id", "updated-stats-banner")
+        self.assertEqual(
+            restarted_store.get_setting("my_stats_banner_file_id"),
+            "updated-stats-banner",
+        )
+        for key, value in settings.items():
+            if key != "my_stats_banner_file_id":
+                self.assertEqual(restarted_store.get_setting(key), value)
+
     def test_runtime_store_handles_admins_custom_countries_and_payments(self):
         database = FakeDatabase()
         repository = MongoRepository(database)
