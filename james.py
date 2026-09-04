@@ -1330,11 +1330,13 @@ async def render_account_store(event, flow, page=1, send_banner=False):
     buy_account_banner = get_buy_account_banner() if flow == "single" else None
     banner = get_banner_reference(get_setting(store_banner_key(flow)))
     if send_banner and buy_account_banner:
-        try:
-            await bot.send_file(event.chat_id, buy_account_banner)
-        except Exception:
-            pass
-    if send_banner and banner:
+        if len(caption) <= 1024:
+            try:
+                await bot.send_file(event.chat_id, buy_account_banner, caption=caption, buttons=buttons)
+                return
+            except Exception:
+                pass
+    if send_banner and banner and not buy_account_banner:
         try:
             await bot.send_file(event.chat_id, banner, caption=caption, buttons=buttons)
             return

@@ -510,6 +510,11 @@ class MongoPersistenceTests(unittest.TestCase):
             render_account_store,
         )
         self.assertIn(
+            "await bot.send_file(event.chat_id, buy_account_banner, caption=caption, buttons=buttons)",
+            render_account_store,
+        )
+        self.assertIn("if len(caption) <= 1024:", render_account_store)
+        self.assertNotIn(
             "await bot.send_file(event.chat_id, buy_account_banner)",
             render_account_store,
         )
