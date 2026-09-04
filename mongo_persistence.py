@@ -1645,6 +1645,13 @@ class MongoRuntimeStore:
             "caption": caption,
             "qr_file_id": qr_file_id,
         }
+        existing = self.custom_payments.find_one({"name": str(name)})
+        if existing:
+            self.custom_payments.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"caption": caption, "qr_file_id": qr_file_id}},
+            )
+            return existing["_id"]
         result = self.custom_payments.insert_one(document)
         return result.inserted_id
 

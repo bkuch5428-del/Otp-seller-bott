@@ -286,6 +286,13 @@ class AutomaticPaymentTests(unittest.TestCase):
         self.assertIn('"adm_payment_toggle|automatic"', source)
         self.assertIn('"adm_payment_toggle|manual"', source)
 
+    def test_custom_payment_qr_uses_persisted_telegram_reference(self):
+        source = open("james.py", encoding="utf-8").read()
+        self.assertIn('qr_file_id = json.dumps({', source)
+        self.assertIn('qr_media = get_banner_reference(qr_file_id)', source)
+        self.assertIn('await bot.send_file(e.chat_id, qr_media, caption=cap, buttons=btns)', source)
+        self.assertNotIn('qr_path = f"qr_{int(time.time())}.jpg"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

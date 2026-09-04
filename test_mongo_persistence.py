@@ -618,6 +618,10 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertEqual(store.custom_country_by_name("Testland")["flag"], "🏳️")
         payment_id = store.add_custom_payment("Test Pay", "<code>pay</code>", "")
         self.assertEqual(store.get_custom_payment("Test Pay")["_id"], payment_id)
+        updated_id = store.add_custom_payment("Test Pay", "updated", '{"id": 123}')
+        self.assertEqual(updated_id, payment_id)
+        self.assertEqual(store.get_custom_payment("Test Pay")["qr_file_id"], '{"id": 123}')
+        self.assertEqual(store.custom_payments.count_documents({"name": "Test Pay"}), 1)
         store.delete_custom_payment(payment_id)
         self.assertIsNone(store.get_custom_payment("Test Pay"))
 

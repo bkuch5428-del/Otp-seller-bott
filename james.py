@@ -3259,14 +3259,18 @@ async def admin_actions(event):
             elif action_data == "addpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
                 name = html.escape((await get_reply(f"{P_CARD} <b>Enter Payment Method Name:</b>\n<i>(e.g., Binance Pay, TRX)</i>")).text)
                 qr_msg = await get_reply(f"📸 <b>Send QR Code Image:</b>\n<i>(Or type <code>skip</code> if no QR needed)</i>")
-                qr_path = ""
+                qr_file_id = ""
                 if qr_msg.photo:
-                    qr_path = f"qr_{int(time.time())}.jpg"
-                    await bot.download_media(qr_msg, qr_path)
+                    photo = qr_msg.photo
+                    qr_file_id = json.dumps({
+                        "id": photo.id,
+                        "access_hash": photo.access_hash,
+                        "file_reference": photo.file_reference.hex(),
+                    })
                 
                 cap_msg = (await get_reply(f"{P_DOC} <b>Enter Payment Caption:</b>\n<i>(Use <code>text</code> to make wallet IDs or UPI copyable)</i>")).text
                 cap_msg = html.escape(cap_msg).replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
-                mongo_store.add_custom_payment(name, cap_msg, qr_path)
+                mongo_store.add_custom_payment(name, cap_msg, qr_file_id)
                 await conv.send_message(f"{P_YES} Payment Method '{name}' added successfully!")
 
             elif action_data == "delpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
@@ -3808,7 +3812,14 @@ async def handle_all_messages(e):
                     cap = payment.get("caption", "") + f"{rate_text}\n\n👇 <b>After paying, send a clear Screenshot here:</b>"
                     btns = [[Button.inline("❌ Cancel", "cancel_action")]]
                     qr_file_id = payment.get("qr_file_id")
-                    if qr_file_id and os.path.exists(qr_file_id):
+                    qr_media = get_banner_reference(qr_file_id)
+                    if qr_media:
+                        try:
+                            await bot.send_file(e.chat_id, qr_media, caption=cap, buttons=btns)
+                        except Exception:
+                            await e.reply(cap, buttons=btns)
+                    elif qr_file_id and os.path.exists(qr_file_id):
+                        # Legacy custom methods may still contain a local path.
                         try: await bot.send_file(e.chat_id, qr_file_id, caption=cap, buttons=btns)
                         except: await e.reply(cap, buttons=btns)
                     else: await e.reply(cap, buttons=btns)
