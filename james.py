@@ -100,6 +100,7 @@ OTP_REGEX = os.getenv("OTP_REGEX", r"\b\d{4,8}\b")
 AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS", 600)
 DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "94.0")
 DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "https://t.me/tgtelehelpbot")
+OWNER_USERNAME_SETTING = "owner_username"
 FAMAPP_UPI_ID = os.getenv("FAMAPP_UPI_ID", "").strip()
 FAMAPP_PAYEE_NAME = os.getenv("FAMAPP_PAYEE_NAME", "FreshTgStore").strip() or "FreshTgStore"
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com").strip() or "imap.gmail.com"
@@ -468,6 +469,10 @@ def get_support_url():
     value = get_setting("support_url")
     url = value if value else DEFAULT_SUPPORT_URL
     return fix_url(url)
+
+def get_owner_url():
+    value = get_setting(OWNER_USERNAME_SETTING, SUPPORT_USERNAME_2)
+    return fix_url(value)
 
 def get_setting(key, default=None):
     return mongo_store.get_setting(key, default)
@@ -882,16 +887,12 @@ def get_terms_buttons():
     ]
 
 def get_support_buttons():
+    channel_url = fix_url(JOIN_URLS[0]) if JOIN_URLS and JOIN_URLS[0] else DEFAULT_SUPPORT_URL
     buttons = [
-        [Button.url(f"📩 @{SUPPORT_USERNAME_1}", f"https://t.me/{SUPPORT_USERNAME_1}")],
-        [Button.url(f"📩 @{SUPPORT_USERNAME_2}", f"https://t.me/{SUPPORT_USERNAME_2}")],
-        [Button.url("📜 Terms & Conditions", get_terms_url())]
+        [Button.url("🆘 Support", get_support_url()), Button.url("👑 Owner", get_owner_url())],
+        [Button.url("📢 Channel", channel_url)],
+        [Button.url("📜 Terms & Conditions", get_terms_url())],
     ]
-    if JOIN_URLS and JOIN_URLS[0]:
-        try:
-            buttons.append([Button.url("📢 Channel", fix_url(JOIN_URLS[0]))])
-        except Exception:
-            pass
     return buttons
 
 def get_join_buttons():
@@ -2182,6 +2183,7 @@ async def admin_panel_handler(event):
         btns.append([Button.inline("📝 Set Welcome Msg", "adm_welcome"), Button.inline("🖼️ Banner Images", "adm_banner")])
         btns.append([Button.inline("📝 Store Messages", "adm_store_messages"), Button.inline("⚙️ Store Buttons", "adm_store_buttons")])
         btns.append([Button.inline("Support URL", "adm_supporturl"), Button.inline("Payments", "adm_payments")])
+        btns.append([Button.inline("👑 Owner", "adm_setting_edit|owner_username")])
         btns.append([Button.inline("Set USDT Rate", "adm_usdtrate")])
         btns.append([Button.inline("Backup Users", "adm_backupusr"), Button.inline("Restore Users", "adm_restoreusr")])
 
@@ -2212,11 +2214,13 @@ async def maintenance_menu(event):
 async def general_settings_menu(event):
     msg = (f"⚙️ <b>General Settings</b>\n\n"
            f"🔗 Support URL: <code>{html.escape(get_support_url())}</code>\n"
+                   f"👑 Owner: <code>{html.escape(get_owner_url())}</code>\n"
            f"📜 Terms URL: <code>{html.escape(get_terms_url())}</code>\n"
            f"💱 USDT rate: <b>{get_usdt_rate()}</b> INR\n"
            f"⏱ Auto-cancel: <b>{get_auto_cancel_seconds()}</b> seconds")
     buttons = [
         [Button.inline("🔗 Support URL", "adm_setting_edit|support_url")],
+        [Button.inline("👑 Owner", "adm_setting_edit|owner_username")],
         [Button.inline("📜 Terms URL", "adm_setting_edit|terms_url")],
         [Button.inline("💱 USDT Rate", "adm_setting_edit|usdt_rate")],
         [Button.inline("⏱ Auto-cancel Seconds", "adm_setting_edit|auto_cancel_seconds")],
@@ -2760,11 +2764,12 @@ async def admin_actions(event):
         if not has_perm(uid, 'p_settings'):
             return await event.answer("Not authorized.", alert=True)
         setting_name = action_data.split("|", 1)[1]
-        if setting_name not in {"support_url", "terms_url", "usdt_rate", "auto_cancel_seconds"}:
+        if setting_name not in {"support_url", "owner_username", "terms_url", "usdt_rate", "auto_cancel_seconds"}:
             return await event.answer("Invalid setting.", alert=True)
         admin_content_state[uid] = {"type": "general_setting", "name": setting_name}
         labels = {
             "support_url": "Support URL (http:// or https://)",
+            "owner_username": "Owner username or Telegram URL",
             "terms_url": "Terms URL (http:// or https://)",
             "usdt_rate": "USDT rate in INR (positive number)",
             "auto_cancel_seconds": "Auto-cancel seconds (at least 1)"
@@ -3548,6 +3553,9 @@ async def handle_all_messages(e):
                     if name in {"support_url", "terms_url"}:
                         if not re.match(r"^https?://[^\s]+$", value, re.IGNORECASE):
                             raise ValueError
+                    elif name == "owner_username":
+                        if not re.match(r"^(?:@[A-Za-z0-9_]{5,32}|https?://t\.me/[A-Za-z0-9_]{5,32})$", value, re.IGNORECASE):
+                            raise ValueError
                     elif name == "usdt_rate":
                         if float(value) <= 0:
                             raise ValueError
@@ -3703,7 +3711,7 @@ async def handle_all_messages(e):
         elif "My Profile" in text: await profile_handler(e)
         elif "My Stats" in text: await stats_handler(e)
         elif "Support" in text: 
-            await e.reply(f"{PE_ANGEL} <b>Fresh Tg Support & Relevant Information</b>\n\n{P_WARN} For support contact our developers:", buttons=get_support_buttons())
+            await e.reply("🟢 <b>Support</b>\n\n⚠️ For support, contact admin.", buttons=get_support_buttons())
         elif "Admin Panel" in text: 
             if is_admin(uid): await admin_panel_handler(e)
 

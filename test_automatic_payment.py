@@ -187,6 +187,26 @@ class AutomaticPaymentTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_support_screen_has_exact_layout_and_persistent_owner_destination(self):
+        buttons = james.get_support_buttons()
+        self.assertEqual(len(buttons), 3)
+        self.assertEqual([button.text for button in buttons[0]], ["🆘 Support", "👑 Owner"])
+        self.assertEqual([button.text for button in buttons[1]], ["📢 Channel"])
+        self.assertEqual([button.text for button in buttons[2]], ["📜 Terms & Conditions"])
+        self.assertEqual(buttons[-1][0].text, "📜 Terms & Conditions")
+
+        source = open("james.py", encoding="utf-8").read()
+        self.assertIn('"🟢 <b>Support</b>\\n\\n⚠️ For support, contact admin."', source)
+        self.assertIn('"owner_username"', source)
+        self.assertIn('"adm_setting_edit|owner_username"', source)
+        james.set_setting("owner_username", "@updated_owner")
+        try:
+            self.assertEqual(james.get_owner_url(), "https://t.me/updated_owner")
+            updated_buttons = james.get_support_buttons()
+            self.assertEqual(updated_buttons[0][1].url, "https://t.me/updated_owner")
+        finally:
+            james.delete_setting("owner_username")
+
 
 if __name__ == "__main__":
     unittest.main()
