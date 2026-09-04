@@ -147,7 +147,7 @@ class AutomaticPaymentTests(unittest.TestCase):
         self.assertIn('data == "dep_upi"', source)
         self.assertIn('casefold() == "cwallet"', source)
         self.assertNotIn('Button.inline(f"👛 Cwallet (+5%)", "depm_Cwallet")', source)
-        self.assertIn('if deposit_input.get(uid, {}).get("step") == "automatic_keypad":', source)
+        self.assertIn('if keypad_step == "automatic_keypad":', source)
         self.assertIn('keypad_step = keypad_state.get("step", "upi_keypad")', source)
         self.assertIn("deposit_input[uid] = {'step': keypad_step, 'val': curr}", source)
         self.assertIn("return await show_automatic_payment_qr(event, amt)", source)
@@ -206,6 +206,41 @@ class AutomaticPaymentTests(unittest.TestCase):
             self.assertEqual(updated_buttons[0][1].url, "https://t.me/updated_owner")
         finally:
             james.delete_setting("owner_username")
+
+    def test_payment_method_visibility_defaults_and_persists_independently(self):
+        james.delete_setting("payment_method_automatic_enabled")
+        james.delete_setting("payment_method_manual_enabled")
+        self.assertTrue(james.is_payment_method_enabled("automatic"))
+        self.assertTrue(james.is_payment_method_enabled("manual"))
+
+        james.set_setting("payment_method_automatic_enabled", "off")
+        self.assertFalse(james.is_payment_method_enabled("automatic"))
+        self.assertTrue(james.is_payment_method_enabled("manual"))
+        james.set_setting("payment_method_manual_enabled", "off")
+        self.assertFalse(james.is_payment_method_enabled("manual"))
+        self.assertFalse(james.is_payment_method_enabled("automatic"))
+
+        restarted = james.MongoRuntimeStore(james.mongo_repository)
+        self.assertEqual(restarted.get_setting("payment_method_automatic_enabled"), "off")
+        self.assertEqual(restarted.get_setting("payment_method_manual_enabled"), "off")
+
+        james.set_setting("payment_method_automatic_enabled", "on")
+        self.assertTrue(james.is_payment_method_enabled("automatic"))
+        self.assertFalse(james.is_payment_method_enabled("manual"))
+        james.delete_setting("payment_method_automatic_enabled")
+        james.delete_setting("payment_method_manual_enabled")
+
+    def test_payment_method_visibility_ui_and_server_guards_are_present(self):
+        source = open("james.py", encoding="utf-8").read()
+        self.assertIn('"payment_method_automatic_enabled"', source)
+        self.assertIn('"payment_method_manual_enabled"', source)
+        self.assertIn('"⚠️ No payment methods are currently available.', source)
+        self.assertIn('data == "automatic_payment"', source)
+        self.assertIn('data == "dep_upi"', source)
+        self.assertIn('Automatic Payment is currently unavailable.', source)
+        self.assertIn('Manual Payment is currently unavailable.', source)
+        self.assertIn('"adm_payment_toggle|automatic"', source)
+        self.assertIn('"adm_payment_toggle|manual"', source)
 
 
 if __name__ == "__main__":

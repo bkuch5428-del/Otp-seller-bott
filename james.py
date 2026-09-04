@@ -474,6 +474,16 @@ def get_owner_url():
     value = get_setting(OWNER_USERNAME_SETTING, SUPPORT_USERNAME_2)
     return fix_url(value)
 
+PAYMENT_METHOD_SETTINGS = {
+    "automatic": "payment_method_automatic_enabled",
+    "manual": "payment_method_manual_enabled",
+}
+
+def is_payment_method_enabled(method):
+    return str(get_setting(PAYMENT_METHOD_SETTINGS[method], "on")).strip().lower() not in {
+        "0", "false", "off", "no"
+    }
+
 def get_setting(key, default=None):
     return mongo_store.get_setting(key, default)
 
@@ -945,16 +955,22 @@ async def deposit_menu(event):
            f"{PE_LIGHTNING} Choose Automatic for instant credit.\n"
            f"{P_WAIT} Choose Manual for other methods.")
     
-    flat_buttons = [
-        Button.inline("🏦 Manual Payment", "dep_upi"),
-        Button.inline("⚡ Automatic Payment", "automatic_payment")
-    ]
+    flat_buttons = []
+    if is_payment_method_enabled("manual"):
+        flat_buttons.append(Button.inline("🏦 Manual Payment", "dep_upi"))
+    if is_payment_method_enabled("automatic"):
+        flat_buttons.append(Button.inline("⚡ Automatic Payment", "automatic_payment"))
     
     customs = mongo_store.list_custom_payments()
     for payment in customs:
         if str(payment.get("name", "")).strip().casefold() == "cwallet":
             continue
         flat_buttons.append(Button.inline(f"💳 {payment['name']}", f"depm_{payment['name']}"))
+    if not flat_buttons:
+        unavailable = "⚠️ No payment methods are currently available.\n\nPlease contact admin."
+        if isinstance(event, events.CallbackQuery.Event):
+            return await event.edit(unavailable)
+        return await event.respond(unavailable)
     btns = format_payment_buttons(flat_buttons)
     btns.append([Button.inline("❌ Cancel", "cancel_action")])
     if await send_bannered_message(event, DEPOSIT_BANNER_SETTING, msg, btns):
@@ -1168,8 +1184,12 @@ async def keypad_logic(event):
             amt = int(curr)
             if amt < 1: 
                 return await event.answer("⚠️ Minimum Deposit is ₹1", alert=True)
-            if deposit_input.get(uid, {}).get("step") == "automatic_keypad":
+            if keypad_step == "automatic_keypad":
+                if not is_payment_method_enabled("automatic"):
+                    return await event.answer("⚠️ Automatic Payment is currently unavailable.", alert=True)
                 return await show_automatic_payment_qr(event, amt)
+            if not is_payment_method_enabled("manual"):
+                return await event.answer("⚠️ Manual Payment is currently unavailable.", alert=True)
             return await show_upi_qr(event, amt)
         except ValueError:
             return await event.answer("⚠️ Invalid amount", alert=True)
@@ -2183,6 +2203,7 @@ async def admin_panel_handler(event):
         btns.append([Button.inline("📝 Set Welcome Msg", "adm_welcome"), Button.inline("🖼️ Banner Images", "adm_banner")])
         btns.append([Button.inline("📝 Store Messages", "adm_store_messages"), Button.inline("⚙️ Store Buttons", "adm_store_buttons")])
         btns.append([Button.inline("Support URL", "adm_supporturl"), Button.inline("Payments", "adm_payments")])
+        btns.append([Button.inline("💳 Payment Methods", "adm_payment_methods")])
         btns.append([Button.inline("👑 Owner", "adm_setting_edit|owner_username")])
         btns.append([Button.inline("Set USDT Rate", "adm_usdtrate")])
         btns.append([Button.inline("Backup Users", "adm_backupusr"), Button.inline("Restore Users", "adm_restoreusr")])
@@ -2227,6 +2248,21 @@ async def general_settings_menu(event):
         [Button.inline("◀️ Back", "adm_adminmain")]
     ]
     await event.edit(msg, buttons=buttons)
+
+async def payment_methods_menu(event):
+    automatic_status = "🟢 ON" if is_payment_method_enabled("automatic") else "🔴 OFF"
+    manual_status = "🟢 ON" if is_payment_method_enabled("manual") else "🔴 OFF"
+    buttons = [
+        [Button.inline(f"⚡ Automatic Payment: {automatic_status}", "adm_payment_toggle|automatic")],
+        [Button.inline(f"💳 Manual Payment: {manual_status}", "adm_payment_toggle|manual")],
+        [Button.inline("🔙 Back", "adm_adminmain")],
+    ]
+    await event.edit(
+        f"💳 <b>Payment Methods</b>\n\n"
+        f"⚡ Automatic Payment: {automatic_status}\n"
+        f"💳 Manual Payment: {manual_status}",
+        buttons=buttons,
+    )
 
 def get_stats_period(period):
     now = datetime.utcnow()
@@ -2718,6 +2754,22 @@ async def admin_actions(event):
             return await event.answer("Not authorized.", alert=True)
         return await maintenance_menu(event) if action_data == "maintenance" else await general_settings_menu(event)
 
+    if action_data == "payment_methods":
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        return await payment_methods_menu(event)
+
+    if action_data.startswith("payment_toggle|"):
+        if not has_perm(uid, 'p_settings'):
+            return await event.answer("Not authorized.", alert=True)
+        method = action_data.split("|", 1)[1]
+        if method not in PAYMENT_METHOD_SETTINGS:
+            return await event.answer("Invalid payment method.", alert=True)
+        setting = PAYMENT_METHOD_SETTINGS[method]
+        set_setting(setting, "off" if is_payment_method_enabled(method) else "on")
+        await event.answer("Payment method visibility updated.", alert=True)
+        return await payment_methods_menu(event)
+
     if action_data == "maintenance_status":
         if not has_perm(uid, 'p_settings'):
             return await event.answer("Not authorized.", alert=True)
@@ -2776,7 +2828,7 @@ async def admin_actions(event):
         }
         return await event.edit(
             f"⚙️ <b>Enter {labels[setting_name]}:</b>\n\n"
-            f"Current: <code>{html.escape(str(get_setting(setting_name, get_support_url() if setting_name == 'support_url' else get_terms_url() if setting_name == 'terms_url' else get_usdt_rate() if setting_name == 'usdt_rate' else get_auto_cancel_seconds())))}</code>",
+            f"Current: <code>{html.escape(str(get_setting(setting_name, get_support_url() if setting_name == 'support_url' else get_owner_url() if setting_name == 'owner_username' else get_terms_url() if setting_name == 'terms_url' else get_usdt_rate() if setting_name == 'usdt_rate' else get_auto_cancel_seconds())))}</code>",
             buttons=[[Button.inline("◀️ Cancel", "adm_general")]]
         )
 
@@ -3883,7 +3935,10 @@ async def handle_callback_query(e):
         elif data == "back_to_stats": await stats_handler(e, is_callback=True)
         elif data == "view_referrals": await view_referrals(e)
             
-        elif data == "automatic_payment": await automatic_payment_init(e)
+        elif data == "automatic_payment":
+            if not is_payment_method_enabled("automatic"):
+                return await e.answer("⚠️ Automatic Payment is currently unavailable.", alert=True)
+            await automatic_payment_init(e)
         elif data.startswith("automatic_check|"):
             parts = data.split("|")
             if len(parts) != 2 or not parts[1]:
@@ -3899,7 +3954,10 @@ async def handle_callback_query(e):
             if method.strip().casefold() == "cwallet":
                 return await e.answer("This payment method is no longer available.", alert=True)
             await manual_deposit_init(e, method)
-        elif data == "dep_upi": await init_upi_keypad(e)
+        elif data == "dep_upi":
+            if not is_payment_method_enabled("manual"):
+                return await e.answer("⚠️ Manual Payment is currently unavailable.", alert=True)
+            await init_upi_keypad(e)
         elif data == "upload_payment_screenshot":
             if uid not in waiting_proof and uid in pending_utr:
                 pending = pending_utr[uid]
