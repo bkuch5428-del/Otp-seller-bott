@@ -45,6 +45,28 @@ services:
         sync: false
       - key: DEFAULT_SUPPORT_URL
         sync: false
+      - key: FAMAPP_UPI_ID
+        sync: false
+      - key: FAMAPP_PAYEE_NAME
+        sync: false
+      - key: IMAP_USERNAME
+        sync: false
+      - key: IMAP_APP_PASSWORD
+        sync: false
+      - key: IMAP_HOST
+        value: imap.gmail.com
+      - key: IMAP_PORT
+        value: "993"
+      - key: IMAP_MAILBOX
+        value: INBOX
+      - key: IMAP_SENDER_FILTER
+        value: no-reply@famapp.in
+      - key: IMAP_LOOKBACK_HOURS
+        value: "24"
+      - key: AUTOMATIC_PAYMENT_EXPIRY_MINUTES
+        value: "10"
+      - key: FAMAPP_PURPOSE_PREFIX
+        value: FAP
       - key: USE_PREMIUM_EMOJIS
         sync: false
       - key: PREMIUM_EMOJI_HEART_FIRE

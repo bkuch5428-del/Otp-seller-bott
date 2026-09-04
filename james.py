@@ -4,6 +4,10 @@ import re
 import asyncio
 import time
 import logging
+import email
+import imaplib
+import secrets
+import string
 import aiohttp
 from aiohttp import web
 import csv
@@ -12,8 +16,13 @@ import shutil
 import html
 import json
 import hashlib
-from datetime import datetime, timedelta
-from urllib.parse import quote
+from datetime import datetime, timedelta, timezone
+from email import policy
+from email.utils import parsedate_to_datetime
+from io import BytesIO
+from urllib.parse import quote, urlencode
+import qrcode
+from qrcode.constants import ERROR_CORRECT_H
 from mongo_persistence import MongoRepository, MongoRuntimeStore, create_mongo_client
 
 from telethon import TelegramClient, events, Button
@@ -95,6 +104,17 @@ OTP_REGEX = os.getenv("OTP_REGEX", r"\b\d{4,8}\b")
 AUTO_CANCEL_SECONDS = env_int("AUTO_CANCEL_SECONDS", 600)
 DEFAULT_USDT_RATE = os.getenv("DEFAULT_USDT_RATE", "94.0")
 DEFAULT_SUPPORT_URL = os.getenv("DEFAULT_SUPPORT_URL", "https://t.me/tgtelehelpbot")
+FAMAPP_UPI_ID = os.getenv("FAMAPP_UPI_ID", "").strip()
+FAMAPP_PAYEE_NAME = os.getenv("FAMAPP_PAYEE_NAME", "FreshTgStore").strip() or "FreshTgStore"
+IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com").strip() or "imap.gmail.com"
+IMAP_PORT = env_int("IMAP_PORT", 993)
+IMAP_USERNAME = os.getenv("IMAP_USERNAME", "").strip()
+IMAP_APP_PASSWORD = os.getenv("IMAP_APP_PASSWORD", "").strip()
+IMAP_MAILBOX = os.getenv("IMAP_MAILBOX", "INBOX").strip() or "INBOX"
+IMAP_SENDER_FILTER = os.getenv("IMAP_SENDER_FILTER", "no-reply@famapp.in").strip()
+IMAP_LOOKBACK_HOURS = env_int("IMAP_LOOKBACK_HOURS", env_int("GMAIL_LOOKBACK_HOURS", 24))
+AUTOMATIC_PAYMENT_EXPIRY_MINUTES = env_int("AUTOMATIC_PAYMENT_EXPIRY_MINUTES", 10)
+FAMAPP_PURPOSE_PREFIX = os.getenv("FAMAPP_PURPOSE_PREFIX", "FAP").strip().upper() or "FAP"
 
 # ================= PREMIUM EMOJIS =================
 USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -937,11 +957,140 @@ async def deposit_menu(event):
     customs = mongo_store.list_custom_payments()
     for payment in customs:
         flat_buttons.append(Button.inline(f"💳 {payment['name']}", f"depm_{payment['name']}"))
+    flat_buttons.append(Button.inline("⚡ Automatic Payment", "automatic_payment"))
     
     btns = format_payment_buttons(flat_buttons)
+    btns.append([Button.inline("❌ Cancel", "cancel_action")])
     if await send_bannered_message(event, DEPOSIT_BANNER_SETTING, msg, btns):
         return
     await bot.send_message(event.chat_id, msg, buttons=btns)
+
+def get_automatic_payment_purpose():
+    suffix = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
+    return f"{FAMAPP_PURPOSE_PREFIX}{datetime.now(timezone.utc):%Y%m%d}{suffix}"
+
+def build_automatic_upi_uri(amount, purpose):
+    if not FAMAPP_UPI_ID:
+        raise ValueError("FAMAPP_UPI_ID is not configured")
+    return "upi://pay?" + urlencode({
+        "pa": FAMAPP_UPI_ID,
+        "pn": FAMAPP_PAYEE_NAME,
+        "am": f"{int(amount)}",
+        "cu": "INR",
+        "tn": purpose,
+    })
+
+def generate_automatic_qr(amount, purpose):
+    qr = qrcode.QRCode(version=None, error_correction=ERROR_CORRECT_H, box_size=10, border=4)
+    qr.add_data(build_automatic_upi_uri(amount, purpose))
+    qr.make(fit=True)
+    output = BytesIO()
+    qr.make_image(fill_color="black", back_color="white").save(output, format="PNG", optimize=True)
+    output.name = "automatic-payment.png"
+    output.seek(0)
+    return output
+
+def automatic_payment_message(amount, order_id):
+    return (
+        "🏦 <b>AUTOMATIC PAYMENT (UPI)</b>\n\n"
+        f"{P_MONEY} Amount: <code>₹{amount}</code>\n"
+        f"{P_ID} Order ID:\n<code>{order_id}</code>\n\n"
+        "👇 Scan the QR below.\n"
+        "Click ✅ Check Payment after paying."
+    )
+
+def parse_famapp_email(raw_message):
+    try:
+        message = email.message_from_bytes(raw_message, policy=policy.default)
+        parts = []
+        if message.is_multipart():
+            for part in message.walk():
+                if part.get_content_disposition() == "attachment":
+                    continue
+                if part.get_content_type() in {"text/plain", "text/html"}:
+                    parts.append(str(part.get_content()))
+        else:
+            parts.append(str(message.get_content()))
+        text = "\n".join(parts)
+        prefix = re.escape(FAMAPP_PURPOSE_PREFIX)
+        purpose_match = re.search(rf"(?i)Purpose\s*:\s*({prefix}[0-9]{{8}}[A-Z0-9]{{6}})", text)
+        amount_match = re.search(r"₹\s*([0-9][0-9,]*(?:\.\d+)?)", text)
+        return {
+            "sender": str(message.get("From", "")),
+            "subject": str(message.get("Subject", "")),
+            "body": text,
+            "purpose": purpose_match.group(1) if purpose_match else None,
+            "amount": float(amount_match.group(1).replace(",", "")) if amount_match else None,
+            "date": message.get("Date"),
+        }
+    except Exception:
+        return None
+
+def verify_automatic_payment(order):
+    if not IMAP_USERNAME or not IMAP_APP_PASSWORD:
+        logger.error("Automatic payment verification is not configured")
+        return "error"
+    expiry = datetime.fromisoformat(str(order["expires_at"]))
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) >= expiry:
+        return "expired"
+    client = None
+    try:
+        client = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        status, _ = client.login(IMAP_USERNAME, IMAP_APP_PASSWORD)
+        if status != "OK":
+            return "error"
+        status, _ = client.select(IMAP_MAILBOX)
+        if status != "OK":
+            return "error"
+        since = (datetime.now(timezone.utc) - timedelta(hours=IMAP_LOOKBACK_HOURS)).strftime("%d-%b-%Y")
+        search_terms = ["FROM", IMAP_SENDER_FILTER, "SINCE", since] if IMAP_SENDER_FILTER else ["SINCE", since]
+        status, data = client.search(None, *search_terms)
+        if status != "OK" or not data or not data[0]:
+            return "pending"
+        for message_id in data[0].split():
+            fetch_status, fetched = client.fetch(message_id, "(RFC822)")
+            if fetch_status != "OK":
+                continue
+            for part in fetched:
+                if not isinstance(part, tuple) or len(part) < 2:
+                    continue
+                parsed = parse_famapp_email(part[1])
+                if not parsed:
+                    continue
+                received = (parsed["subject"] + "\n" + parsed["body"]).lower()
+                sender_match = not IMAP_SENDER_FILTER or IMAP_SENDER_FILTER.lower() in parsed["sender"].lower()
+                outgoing_match = "your payment" in received or "successfully paid" in received
+                received_match = (
+                    re.search(r"you\s+received\s+₹\s*[0-9]", received) is not None
+                    or "you have successfully received" in received
+                )
+                if (sender_match and not outgoing_match and received_match
+                        and parsed["amount"] == float(order["amount_inr"])
+                        and parsed["purpose"] == order["payment_purpose"]):
+                    return "success"
+        return "pending"
+    except Exception:
+        logger.exception("Automatic payment IMAP verification failed")
+        return "error"
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+            try:
+                client.logout()
+            except Exception:
+                pass
+
+async def automatic_payment_init(event):
+    deposit_input[event.sender_id] = {"step": "automatic_keypad", "val": "0"}
+    await event.edit(
+        f"{P_KEY} <b>ENTER AMOUNT IN INR</b> (Min ₹1)\n\n{P_MONEY} <code>₹0</code>",
+        buttons=get_keypad(),
+    )
 
 def get_keypad():
     return [
@@ -1037,6 +1186,8 @@ async def keypad_logic(event):
             amt = int(curr)
             if amt < 1: 
                 return await event.answer("⚠️ Minimum Deposit is ₹1", alert=True)
+            if deposit_input.get(uid, {}).get("step") == "automatic_keypad":
+                return await show_automatic_payment_qr(event, amt)
             return await show_upi_qr(event, amt)
         except ValueError:
             return await event.answer("⚠️ Invalid amount", alert=True)
@@ -1044,9 +1195,10 @@ async def keypad_logic(event):
     deposit_input[uid] = {'step': 'upi_keypad', 'val': curr}
     
     try:
+        upi_line = "" if deposit_input.get(uid, {}).get("step") == "automatic_keypad" else f"💳 UPI ID: <code>{UPI_ID}</code>\n\n"
         await event.edit(f"{P_KEY} <b>ENTER AMOUNT IN INR</b>\n\n"
-                        f"💳 UPI ID: <code>{UPI_ID}</code>\n\n"
-                        f"{P_MONEY} <code>₹{curr}</code>", 
+                        f"{upi_line}"
+                        f"{P_MONEY} <code>₹{curr}</code>",
                         buttons=get_keypad())
     except MessageNotModifiedError:
         pass
@@ -1121,6 +1273,125 @@ async def show_upi_qr(event, amount):
             [Button.inline("📸 Upload Payment Screenshot", "upload_payment_screenshot")],
             [Button.inline("❌ Cancel", "cancel_action")]
         ])
+
+async def show_automatic_payment_qr(event, amount):
+    uid = event.sender_id
+    await event.answer("⏳ Generating Payment QR....", alert=False)
+    try:
+        order_id = f"ORD-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(4).upper()}"
+        while mongo_store.get_automatic_payment(order_id):
+            order_id = f"ORD-{datetime.now(timezone.utc):%Y%m%d}-{secrets.token_hex(4).upper()}"
+        purpose = get_automatic_payment_purpose()
+        upi_uri = build_automatic_upi_uri(amount, purpose)
+        qr_file = generate_automatic_qr(amount, purpose)
+        created_at = datetime.now(timezone.utc)
+        expires_at = created_at + timedelta(minutes=AUTOMATIC_PAYMENT_EXPIRY_MINUTES)
+        mongo_store.create_automatic_payment(
+            order_id,
+            uid,
+            amount,
+            purpose,
+            upi_uri,
+            created_at.isoformat(),
+            expires_at.isoformat(),
+        )
+        payment_message = automatic_payment_message(amount, order_id)
+        await event.delete()
+        await bot.send_file(
+            uid,
+            qr_file,
+            caption=payment_message,
+            force_document=False,
+            mime_type="image/png",
+            buttons=[
+                [Button.inline("✅ Check Payment", f"automatic_check|{order_id}")],
+                [Button.inline("❌ Cancel", f"automatic_cancel|{order_id}")],
+            ],
+        )
+    except Exception:
+        logger.exception("Automatic payment QR generation failed uid=%s", uid)
+        try:
+            await event.edit("❌ Could not generate the payment QR. Please try again later.")
+        except Exception:
+            await bot.send_message(uid, "❌ Could not generate the payment QR. Please try again later.")
+
+async def check_automatic_payment(event, order_id):
+    uid = event.sender_id
+    await event.answer("🔎 Checking payment...", alert=False)
+    try:
+        order = mongo_store.get_automatic_payment(order_id)
+        if not order or int(order.get("user_id")) != int(uid):
+            return await event.answer("❌ Payment order not found.", alert=True)
+        if order.get("status") == "verified":
+            return await event.answer("✅ Payment already verified.", alert=True)
+        if order.get("status") == "cancelled":
+            return await event.answer("❌ Payment session was cancelled.", alert=True)
+        expiry = datetime.fromisoformat(str(order["expires_at"]))
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= expiry:
+            mongo_store.update_automatic_payment_status(order_id, "pending", "expired", "expired")
+            return await event.answer("❌ Payment session expired. Please create a new payment order.", alert=True)
+
+        result = await asyncio.to_thread(verify_automatic_payment, order)
+        if result == "pending":
+            mongo_store.update_automatic_payment_status(order_id, "pending", "pending", "not_found")
+            return await event.answer("⏳ Payment Not Received Yet.\n\nIf you have already paid, contact admin.", alert=True)
+        if result == "expired":
+            mongo_store.update_automatic_payment_status(order_id, "pending", "expired", "expired")
+            return await event.answer("❌ Payment session expired. Please create a new payment order.", alert=True)
+        if result != "success":
+            mongo_store.update_automatic_payment_status(order_id, "pending", "pending", "verification_error")
+            return await event.answer("⚠️ Payment verification is temporarily unavailable. Please try again.", alert=True)
+
+        amount = int(order["amount_inr"])
+        previous_balance = mongo_store.get_balance(uid)
+        credit = update_balance(
+            uid,
+            amount,
+            f"automatic_payment:{order_id}",
+            "automatic_payment_credit",
+            extra_inc={"total_deposited": amount},
+        )
+        if not credit.get("applied") and not credit.get("already_applied"):
+            raise RuntimeError("Automatic payment wallet credit was not applied")
+        mongo_store.update_automatic_payment_status(
+            order_id,
+            "pending",
+            "verified",
+            "verified",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        if credit.get("already_applied"):
+            return await event.answer("✅ Payment already verified.", alert=True)
+        new_balance = credit.get("balance", previous_balance + amount)
+        await event.delete()
+        await bot.send_message(uid, f"✅ Payment Successful! ₹{amount} added to your wallet.")
+        await bot.send_message(
+            uid,
+            "✅ <b>Payment Auto-Verified!</b>\n\n"
+            f"{P_MONEY} Amount Added: ${to_usd(amount):.2f} (₹{amount})\n"
+            f"📉 Previous Balance: ${to_usd(previous_balance):.2f} (₹{previous_balance})\n"
+            f"📈 New Balance: ${to_usd(new_balance):.2f} (₹{new_balance})",
+        )
+    except Exception:
+        logger.exception("Automatic payment check failed uid=%s order_id=%s", uid, order_id)
+        await event.answer("⚠️ Payment verification is temporarily unavailable. Please try again.", alert=True)
+
+async def cancel_automatic_payment(event, order_id):
+    uid = event.sender_id
+    await event.answer("Payment cancelled.", alert=False)
+    try:
+        order = mongo_store.get_automatic_payment(order_id)
+        if not order or int(order.get("user_id")) != int(uid):
+            return await event.answer("❌ Payment order not found.", alert=True)
+        if order.get("status") == "verified":
+            return await event.answer("✅ Payment already verified.", alert=True)
+        mongo_store.update_automatic_payment_status(order_id, "pending", "cancelled", "cancelled")
+        await event.delete()
+    except Exception:
+        logger.exception("Automatic payment cancellation failed uid=%s order_id=%s", uid, order_id)
+        await event.answer("❌ Could not cancel this payment session.", alert=True)
 
 async def submit_utr_handler(event, order_id):
     """Handle UTR submission with screenshot"""
@@ -3648,6 +3919,17 @@ async def handle_callback_query(e):
         elif data == "back_to_stats": await stats_handler(e, is_callback=True)
         elif data == "view_referrals": await view_referrals(e)
             
+        elif data == "automatic_payment": await automatic_payment_init(e)
+        elif data.startswith("automatic_check|"):
+            parts = data.split("|")
+            if len(parts) != 2 or not parts[1]:
+                return await e.answer("❌ Invalid payment order.", alert=True)
+            await check_automatic_payment(e, parts[1])
+        elif data.startswith("automatic_cancel|"):
+            parts = data.split("|")
+            if len(parts) != 2 or not parts[1]:
+                return await e.answer("❌ Invalid payment order.", alert=True)
+            await cancel_automatic_payment(e, parts[1])
         elif data.startswith("depm_"): await manual_deposit_init(e, data.replace("depm_", ""))
         elif data == "dep_upi": await init_upi_keypad(e)
         elif data == "upload_payment_screenshot":

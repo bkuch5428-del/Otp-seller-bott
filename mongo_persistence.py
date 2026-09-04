@@ -31,6 +31,7 @@ COLLECTION_NAMES = (
     "auto_prices",
     "deposits",
     "upi_orders",
+    "automatic_payments",
     "orders",
     "custom_payments",
     "admins",
@@ -125,6 +126,16 @@ COLLECTION_DEFINITIONS = {
         required_fields=("_id", "order_id", "user_id", "amount", "status"),
         identity_fields=("_id",),
     ),
+    "automatic_payments": CollectionDefinition(
+        "automatic_payments",
+        managed_fields=(
+            "_id", "order_id", "user_id", "amount_inr", "payment_purpose",
+            "upi_uri", "status", "created_at", "expires_at", "verification_result",
+            "verified_at",
+        ),
+        required_fields=("_id", "order_id", "user_id", "amount_inr", "payment_purpose", "status"),
+        identity_fields=("_id",),
+    ),
     "orders": CollectionDefinition(
         "orders",
         managed_fields=("_id", "user_id", "country", "year", "price", "phone", "otp", "date"),
@@ -217,6 +228,13 @@ INDEX_DEFINITIONS = {
     "upi_orders": (
         IndexDefinition("_id_", (("_id", 1),), unique=True),
         IndexDefinition("upi_orders_user_status", (("user_id", 1), ("status", 1))),
+    ),
+    "automatic_payments": (
+        IndexDefinition("_id_", (("_id", 1),), unique=True),
+        IndexDefinition("automatic_payments_order_id", (("order_id", 1),), unique=True),
+        IndexDefinition("automatic_payments_user_status", (("user_id", 1), ("status", 1))),
+        IndexDefinition("automatic_payments_expiry", (("status", 1), ("expires_at", 1))),
+        IndexDefinition("automatic_payments_purpose", (("payment_purpose", 1),), unique=True),
     ),
     "orders": (
         IndexDefinition("_id_", (("_id", 1),), unique=True),
@@ -916,6 +934,10 @@ class MongoRuntimeStore:
         return self.repository.collection("upi_orders")
 
     @property
+    def automatic_payments(self) -> Any:
+        return self.repository.collection("automatic_payments")
+
+    @property
     def orders(self) -> Any:
         return self.repository.collection("orders")
 
@@ -1234,6 +1256,54 @@ class MongoRuntimeStore:
 
     def get_upi_order(self, order_id: str) -> Mapping[str, Any] | None:
         return self.upi_orders.find_one({"_id": str(order_id)})
+
+    def create_automatic_payment(
+        self,
+        order_id: str,
+        user_id: int,
+        amount_inr: int,
+        payment_purpose: str,
+        upi_uri: str,
+        created_at: str,
+        expires_at: str,
+    ) -> Mapping[str, Any]:
+        document = {
+            "_id": str(order_id),
+            "order_id": str(order_id),
+            "user_id": int(user_id),
+            "amount_inr": int(amount_inr),
+            "payment_purpose": str(payment_purpose),
+            "upi_uri": str(upi_uri),
+            "status": "pending",
+            "created_at": str(created_at),
+            "expires_at": str(expires_at),
+            "verification_result": None,
+            "verified_at": None,
+        }
+        self.automatic_payments.insert_one(document)
+        return document
+
+    def get_automatic_payment(self, order_id: str) -> Mapping[str, Any] | None:
+        return self.automatic_payments.find_one({"_id": str(order_id)})
+
+    def update_automatic_payment_status(
+        self,
+        order_id: str,
+        from_status: str,
+        to_status: str,
+        verification_result: str | None = None,
+        verified_at: str | None = None,
+    ) -> bool:
+        fields: dict[str, Any] = {"status": str(to_status)}
+        if verification_result is not None:
+            fields["verification_result"] = str(verification_result)
+        if verified_at is not None:
+            fields["verified_at"] = str(verified_at)
+        result = self.automatic_payments.update_one(
+            {"_id": str(order_id), "status": str(from_status)},
+            {"$set": fields},
+        )
+        return bool(getattr(result, "matched_count", 0))
 
     def delete_order(self, order_id: Any) -> int:
         result = self.orders.delete_one({"_id": int(order_id)})

@@ -1,0 +1,153 @@
+import asyncio
+import os
+import unittest
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from urllib.parse import parse_qs, urlsplit
+from unittest.mock import patch
+
+os.environ.setdefault("API_ID", "1")
+os.environ.setdefault("API_HASH", "test-hash")
+os.environ.setdefault("BOT_TOKEN", "1:test-token")
+os.environ.setdefault("ADMIN_ID", "1")
+os.environ.setdefault("MONGODB_URI", "mongodb://localhost:27017")
+os.environ.setdefault("FAMAPP_UPI_ID", "famapp@example")
+os.environ.setdefault("FAMAPP_PAYEE_NAME", "Test Payee")
+os.environ.setdefault("IMAP_USERNAME", "test@example.com")
+os.environ.setdefault("IMAP_APP_PASSWORD", "test-password")
+
+from test_mongo_persistence import FakeDatabase  # noqa: E402
+import mongo_persistence  # noqa: E402
+from mongo_persistence import MongoRepository, MongoRuntimeStore  # noqa: E402
+
+
+class FakeMongoClient:
+    def __init__(self):
+        self.database = FakeDatabase()
+        self.admin = self
+
+    def command(self, _name):
+        return {"ok": 1}
+
+    def __getitem__(self, _name):
+        return self.database
+
+
+with patch.object(mongo_persistence, "create_mongo_client", return_value=FakeMongoClient()):
+    import james  # noqa: E402
+
+
+class FakeImap:
+    raw_email = b"""From: no-reply@famapp.in
+Subject: You received \xe2\x82\xb920 in your FamX account
+Date: Fri, 04 Sep 2026 12:00:00 +0000
+Content-Type: text/plain; charset=utf-8
+
+You have successfully received \xe2\x82\xb920
+Purpose :
+FAP20260904ABC123
+"""
+
+    def __init__(self, *_args):
+        self.closed = False
+
+    def login(self, *_args):
+        return "OK", []
+
+    def select(self, _mailbox):
+        return "OK", []
+
+    def search(self, *_args):
+        return "OK", [b"1"]
+
+    def fetch(self, *_args):
+        return "OK", [(b"header", self.raw_email)]
+
+    def close(self):
+        self.closed = True
+        return "OK", []
+
+    def logout(self):
+        return "BYE", []
+
+
+class AutomaticPaymentTests(unittest.TestCase):
+    def test_uri_and_qr_contain_amount_and_hidden_purpose(self):
+        purpose = "FAP20260904ABC123"
+        uri = james.build_automatic_upi_uri(20, purpose)
+        params = parse_qs(urlsplit(uri).query)
+        self.assertEqual(params["pa"], ["famapp@example"])
+        self.assertEqual(params["am"], ["20"])
+        self.assertEqual(params["tn"], [purpose])
+        self.assertNotIn(james.FAMAPP_UPI_ID, "🏦 AUTOMATIC PAYMENT (UPI) Amount: ₹20")
+        qr = james.generate_automatic_qr(20, purpose)
+        self.assertEqual(qr.name, "automatic-payment.png")
+        self.assertGreater(len(qr.getvalue()), 100)
+        payment_screen = james.automatic_payment_message(20, "ORD-20260904-ABC12345")
+        self.assertNotIn(james.FAMAPP_UPI_ID, payment_screen)
+        self.assertNotIn(purpose, payment_screen)
+        self.assertIn("₹20", payment_screen)
+        self.assertIn("ORD-20260904-ABC12345", payment_screen)
+
+    def test_email_verification_requires_received_amount_and_purpose(self):
+        order = {
+            "amount_inr": 20,
+            "payment_purpose": "FAP20260904ABC123",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        }
+        with patch.object(james.imaplib, "IMAP4_SSL", FakeImap):
+            self.assertEqual(james.verify_automatic_payment(order), "success")
+        wrong_amount = dict(order, amount_inr=21)
+        with patch.object(james.imaplib, "IMAP4_SSL", FakeImap):
+            self.assertEqual(james.verify_automatic_payment(wrong_amount), "pending")
+        expired = dict(order, expires_at=(datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat())
+        with patch.object(james.imaplib, "IMAP4_SSL", FakeImap):
+            self.assertEqual(james.verify_automatic_payment(expired), "expired")
+
+    def test_mongodb_order_persists_and_credit_is_idempotent(self):
+        database = FakeDatabase()
+        repository = MongoRepository(database)
+        repository.prepare()
+        store = MongoRuntimeStore(repository)
+        store.ensure_user(7)
+        store.create_automatic_payment(
+            "ORD-20260904-ABC12345",
+            7,
+            20,
+            "FAP20260904ABC123",
+            "upi://pay?tn=FAP20260904ABC123",
+            datetime.now(timezone.utc).isoformat(),
+            (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        )
+        restarted = MongoRuntimeStore(MongoRepository(database))
+        order = restarted.get_automatic_payment("ORD-20260904-ABC12345")
+        self.assertEqual(order["status"], "pending")
+        first = restarted.credit_balance(
+            7, 20, "automatic_payment:ORD-20260904-ABC12345", "automatic_payment_credit",
+            extra_inc={"total_deposited": 20},
+        )
+        second = restarted.credit_balance(
+            7, 20, "automatic_payment:ORD-20260904-ABC12345", "automatic_payment_credit",
+            extra_inc={"total_deposited": 20},
+        )
+        self.assertTrue(first["applied"])
+        self.assertTrue(second["already_applied"])
+        self.assertEqual(restarted.get_balance(7), 20)
+        self.assertTrue(restarted.update_automatic_payment_status(
+            "ORD-20260904-ABC12345", "pending", "verified", "verified"
+        ))
+        self.assertEqual(restarted.get_automatic_payment("ORD-20260904-ABC12345")["status"], "verified")
+
+    def test_deposit_menu_and_callbacks_keep_existing_paths(self):
+        source = open("james.py", encoding="utf-8").read()
+        self.assertIn('Button.inline("⚡ Automatic Payment", "automatic_payment")', source)
+        self.assertIn('data == "automatic_payment"', source)
+        self.assertIn('data.startswith("automatic_check|")', source)
+        self.assertIn('data.startswith("automatic_cancel|")', source)
+        self.assertIn('data.startswith("depm_")', source)
+        self.assertIn('data == "dep_upi"', source)
+        self.assertIn('if deposit_input.get(uid, {}).get("step") == "automatic_keypad":', source)
+
+
+if __name__ == "__main__":
+    unittest.main()
