@@ -134,6 +134,7 @@ IMAP_LOOKBACK_HOURS = env_int("IMAP_LOOKBACK_HOURS", env_int("GMAIL_LOOKBACK_HOU
 AUTOMATIC_PAYMENT_EXPIRY_MINUTES = env_int("AUTOMATIC_PAYMENT_EXPIRY_MINUTES", 10)
 FAMAPP_PURPOSE_PREFIX = os.getenv("FAMAPP_PURPOSE_PREFIX", "FAP").strip().upper() or "FAP"
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
+BOT_SESSION_ID_SETTING = "bot_session_bot_id"
 
 # ================= PREMIUM EMOJIS =================
 USE_PREMIUM_EMOJIS = os.getenv("USE_PREMIUM_EMOJIS", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -308,7 +309,16 @@ os.makedirs("sessions", exist_ok=True)
 os.makedirs("screenshots", exist_ok=True)
 
 session_name = f"bot_session_{BOT_TOKEN.split(':')[0]}"
-stored_bot_session = decrypt_session_string(mongo_store.get_setting("bot_session_string"))
+current_bot_id = BOT_TOKEN.split(":", 1)[0]
+stored_bot_session_id = str(mongo_store.get_setting(BOT_SESSION_ID_SETTING, "")).strip()
+stored_bot_session_value = mongo_store.get_setting("bot_session_string")
+if stored_bot_session_value and stored_bot_session_id != current_bot_id:
+    # This targets only the main bot session; inventory and business data are untouched.
+    mongo_store.delete_setting("bot_session_string")
+    mongo_store.delete_setting(BOT_SESSION_ID_SETTING)
+    stored_bot_session_value = None
+    logger.warning("Reset persisted main bot session because BOT_TOKEN identity changed")
+stored_bot_session = decrypt_session_string(stored_bot_session_value)
 bot = TelegramClient(StringSession(stored_bot_session) if stored_bot_session else session_name, API_ID, API_HASH)
 bot.parse_mode = 'html'
 
@@ -424,6 +434,21 @@ def persist_bot_session():
             "bot_session_string",
             encrypt_session_string(session_string),
         )
+        mongo_store.set_setting(BOT_SESSION_ID_SETTING, current_bot_id)
+
+async def verify_bot_identity():
+    identity = await bot.get_me()
+    actual_bot_id = str(getattr(identity, "id", ""))
+    if actual_bot_id != current_bot_id:
+        raise RuntimeError(
+            "Telegram bot identity mismatch after startup: "
+            f"expected={current_bot_id} actual={actual_bot_id}"
+        )
+    logger.info(
+        "Telegram bot authenticated as id=%s username=%s",
+        actual_bot_id,
+        getattr(identity, "username", None) or "none",
+    )
 
 # ================= HELPER FUNCTIONS =================
 def is_bot_online():
@@ -4419,6 +4444,8 @@ async def handle_callback_query(e):
 
 async def main():
     await migrate_inventory_sessions()
+    await verify_bot_identity()
+    persist_bot_session()
     port = int(os.getenv("PORT", "10000"))
     app = web.Application()
     app.router.add_get("/", lambda request: web.Response(text="OK"))
@@ -4441,6 +4468,5 @@ async def main():
 
 if __name__ == '__main__':
     bot.start(bot_token=BOT_TOKEN)
-    persist_bot_session()
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
