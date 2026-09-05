@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from email import policy
 from email.utils import parsedate_to_datetime
 from io import BytesIO
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
 from mongo_persistence import MongoRepository, MongoRuntimeStore, create_mongo_client
@@ -106,7 +106,7 @@ JOIN_URLS = env_list("JOIN_URLS", "https://t.me/moviesmasterupdates")
 # ========== LINKS & MEDIA ==========
 TERMS_URL = os.getenv(
     "TERMS_URL",
-    "https://james-xdd.github.io/Terms-And-Conditions/James.html"
+    "https://otp-seller-bott.onrender.com/terms/"
 )
 
 # ========== UPI DETAILS ==========
@@ -3902,7 +3902,13 @@ async def handle_all_messages(e):
                 value = text.strip()
                 try:
                     if name in {"support_url", "terms_url"}:
-                        if not re.match(r"^https?://[^\s]+$", value, re.IGNORECASE):
+                        parsed_url = urlsplit(value)
+                        if (
+                            parsed_url.scheme.lower() not in {"http", "https"}
+                            or not parsed_url.netloc
+                            or not parsed_url.hostname
+                            or any(character.isspace() for character in value)
+                        ):
                             raise ValueError
                     elif name == "owner_username":
                         if not re.match(r"^(?:@[A-Za-z0-9_]{5,32}|https?://t\.me/[A-Za-z0-9_]{5,32})$", value, re.IGNORECASE):
