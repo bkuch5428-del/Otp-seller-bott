@@ -4266,10 +4266,47 @@ async def handle_callback_query(e):
             deposit = mongo_store.get_deposit(dep_id)
             if not deposit or deposit.get("status") != 'pending':
                 return await e.edit(f"{P_WARN} Already processed.")
-            admin_dep_state[uid] = {'target_uid': t_uid, 'dep_id': dep_id, 'step': 'wait_reason', 'msg_id': e.message.id}
-            await bot.send_message(uid, f"{P_WARN} Reply to this message with the REASON for rejecting user <code>{t_uid}</code>:")
-            try: await e.answer("Check your bot PMs to enter the reason.", alert=True)
-            except: pass
+            transitioned = mongo_store.transition_deposit(
+                dep_id,
+                "pending",
+                "rejected",
+            )
+            if not transitioned:
+                return await e.edit(f"{P_WARN} Already processed.")
+
+            amount = int(deposit.get("amount") or 0)
+            rejection_reason = "Rejected by admin"
+            await log_manual_deposit(
+                t_uid,
+                amount,
+                deposit.get("utr"),
+                False,
+            )
+            try:
+                await bot.edit_message(
+                    LOG_CHANNEL_ID,
+                    e.message.id,
+                    f"{P_NO} <b>Payment Rejected</b>\n\n"
+                    f"User: <code>{t_uid}</code>\n"
+                    f"Amount: {P_INR}{amount}\n"
+                    f"Reason: {rejection_reason}",
+                )
+            except Exception:
+                logger.exception("Unable to update rejected deposit admin message dep_id=%s", dep_id)
+            try:
+                await bot.send_message(
+                    int(t_uid),
+                    f"{P_NO} <b>Payment Rejected</b>\n\n"
+                    "Your payment/deposit has been rejected by admin.\n\n"
+                    f"{P_MONEY} Amount: {P_INR}{amount}\n\n"
+                    "If you believe this is a mistake, please contact support.",
+                )
+            except Exception:
+                logger.exception("Unable to notify user about rejected deposit dep_id=%s", dep_id)
+            try:
+                await e.answer("Payment rejected.", alert=True)
+            except Exception:
+                logger.exception("Unable to acknowledge rejected deposit dep_id=%s", dep_id)
 
     except Exception as ex: print(f"Callback Error: {ex}")
 

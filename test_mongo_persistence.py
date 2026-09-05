@@ -768,6 +768,9 @@ class MongoPersistenceTests(unittest.TestCase):
         self.assertTrue(store.transition_deposit(deposit["_id"], "pending", "rejected"))
         self.assertFalse(store.transition_deposit(deposit["_id"], "pending", "rejected"))
         self.assertEqual(store.get_deposit(deposit["_id"])["status"], "rejected")
+        self.assertEqual(store.get_balance(27), 0)
+        self.assertEqual(store.approve_deposit(deposit["_id"], 80)["status"], "processed")
+        self.assertEqual(store.get_deposit(deposit["_id"])["status"], "rejected")
 
     def test_upi_order_creation_is_idempotent_and_conflict_safe(self):
         _database, store = self.make_store()
