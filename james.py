@@ -606,9 +606,39 @@ BUY_ACCOUNT_BANNER_SETTING = "buy_account_banner_file_id"
 MY_STATS_BANNER_SETTING = "my_stats_banner_file_id"
 MY_PROFILE_BANNER_SETTING = "my_profile_banner_file_id"
 DEPOSIT_BANNER_SETTING = "deposit_banner_file_id"
+TERMS_TEXT_SETTING = "editable_terms_text"
+TERMS_BANNER_SETTING = "editable_terms_banner_file_id"
 
 def get_buy_account_banner():
     return get_banner_reference(get_setting(BUY_ACCOUNT_BANNER_SETTING))
+
+def get_editable_terms_text():
+    return get_setting(TERMS_TEXT_SETTING, "") or ""
+
+def get_editable_terms_banner():
+    return get_banner_reference(get_setting(TERMS_BANNER_SETTING))
+
+def split_telegram_text(text, limit):
+    return [text[index:index + limit] for index in range(0, len(text), limit)] or [""]
+
+async def send_editable_terms_preview(event):
+    text = get_editable_terms_text()
+    banner = get_editable_terms_banner()
+    if not text:
+        return await event.answer("No editable T&C text has been saved.", alert=True)
+    try:
+        if banner:
+            chunks = split_telegram_text(text, 1024)
+            await bot.send_file(event.chat_id, banner, caption=chunks[0], parse_mode=None)
+            for chunk in chunks[1:]:
+                await bot.send_message(event.chat_id, chunk, parse_mode=None)
+        else:
+            for chunk in split_telegram_text(text, 4096):
+                await bot.send_message(event.chat_id, chunk, parse_mode=None)
+        await event.answer("Preview sent.", alert=True)
+    except Exception:
+        logger.exception("Editable T&C preview failed")
+        await event.answer("Could not send T&C preview.", alert=True)
 
 async def send_bannered_message(event, setting, message, buttons=None):
     banner = get_banner_reference(get_setting(setting))
@@ -2337,6 +2367,7 @@ async def admin_panel_handler(event):
         r5.extend([Button.inline("Discount", "adm_discount"), Button.inline("Ref %", "adm_refpct")])
         btns.append(r5)
         btns.append([Button.inline("📝 Set Welcome Msg", "adm_welcome"), Button.inline("🖼️ Banner Images", "adm_banner")])
+        btns.append([Button.inline("📜 Editable T&C", "adm_terms_content")])
         btns.append([Button.inline("📝 Store Messages", "adm_store_messages"), Button.inline("⚙️ Store Buttons", "adm_store_buttons")])
         btns.append([Button.inline("Support URL", "adm_supporturl"), Button.inline("Payments", "adm_payments")])
         btns.append([Button.inline("💳 Payment Methods", "adm_payment_methods")])
@@ -2846,6 +2877,24 @@ async def preview_store(event, flow):
     await render_account_store(PreviewEvent(), flow, 1, send_banner=True)
     return await event.answer("Preview sent.", alert=True)
 
+async def editable_terms_menu(event):
+    if not (event.sender_id in ADMIN_IDS or has_perm(event.sender_id, "p_settings")):
+        return await event.answer("Not authorized.", alert=True)
+    text = get_editable_terms_text()
+    banner_status = "set" if get_setting(TERMS_BANNER_SETTING) else "not set"
+    return await event.edit(
+        "📜 <b>Editable Terms & Conditions</b>\n\n"
+        f"Text: {'set' if text else 'not set'}\n"
+        f"Banner: {banner_status}\n\n"
+        "The existing Terms URL remains unchanged.",
+        buttons=[
+            [Button.inline("✏️ Edit T&C Text", "adm_terms_edit")],
+            [Button.inline("🖼 Set Banner", "adm_terms_banner_set"), Button.inline("🗑 Remove Banner", "adm_terms_banner_remove")],
+            [Button.inline("👁 Preview", "adm_terms_preview")],
+            [Button.inline("↩️ Back", "adm_adminmain")],
+        ],
+    )
+
 async def admin_actions(event):
     data_full = event.data.decode()
     if not data_full.startswith("adm_"): return
@@ -2894,6 +2943,40 @@ async def admin_actions(event):
         if not has_perm(uid, 'p_settings'):
             return await event.answer("Not authorized.", alert=True)
         return await payment_methods_menu(event)
+
+    if action_data == "terms_content":
+        return await editable_terms_menu(event)
+
+    if action_data == "terms_edit":
+        if not (uid in ADMIN_IDS or has_perm(uid, "p_settings")):
+            return await event.answer("Not authorized.", alert=True)
+        admin_content_state[uid] = "editable_terms_text"
+        return await event.edit(
+            "✏️ <b>Send the complete T&C text.</b>\n\n"
+            "The existing Terms URL setting will not be changed.",
+            buttons=[[Button.inline("↩️ Cancel", "adm_terms_content")]],
+        )
+
+    if action_data == "terms_banner_set":
+        if not (uid in ADMIN_IDS or has_perm(uid, "p_settings")):
+            return await event.answer("Not authorized.", alert=True)
+        admin_content_state[uid] = "editable_terms_banner"
+        return await event.edit(
+            "🖼 <b>Send the T&C banner image.</b>",
+            buttons=[[Button.inline("↩️ Cancel", "adm_terms_content")]],
+        )
+
+    if action_data == "terms_banner_remove":
+        if not (uid in ADMIN_IDS or has_perm(uid, "p_settings")):
+            return await event.answer("Not authorized.", alert=True)
+        delete_setting(TERMS_BANNER_SETTING)
+        await event.answer("T&C banner removed.", alert=True)
+        return await editable_terms_menu(event)
+
+    if action_data == "terms_preview":
+        if not (uid in ADMIN_IDS or has_perm(uid, "p_settings")):
+            return await event.answer("Not authorized.", alert=True)
+        return await send_editable_terms_preview(event)
 
     if action_data.startswith("payment_toggle|"):
         if not has_perm(uid, 'p_settings'):
@@ -3739,6 +3822,30 @@ async def handle_all_messages(e):
             if text.strip().lower() == "/cancel":
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Cancelled.")
+            if content_type == "editable_terms_text":
+                if not text.strip():
+                    return await e.reply("❌ T&C text cannot be empty.")
+                set_setting(TERMS_TEXT_SETTING, text)
+                admin_content_state.pop(uid, None)
+                return await e.reply(
+                    "✅ T&C text saved.",
+                    buttons=[[Button.inline("↩️ Back", "adm_terms_content")]],
+                )
+            if content_type == "editable_terms_banner":
+                if not e.photo:
+                    return await e.reply("❌ Please send a Telegram photo.")
+                photo = e.photo
+                reference = {
+                    "id": photo.id,
+                    "access_hash": photo.access_hash,
+                    "file_reference": photo.file_reference.hex(),
+                }
+                set_setting(TERMS_BANNER_SETTING, json.dumps(reference))
+                admin_content_state.pop(uid, None)
+                return await e.reply(
+                    "✅ T&C banner saved.",
+                    buttons=[[Button.inline("↩️ Back", "adm_terms_content")]],
+                )
             if isinstance(content_type, dict) and content_type.get("type") == "store_message":
                 if not text.strip():
                     return await e.reply("❌ Store message cannot be empty.")
