@@ -450,7 +450,9 @@ def has_perm(uid, perm):
     return mongo_store.has_permission(uid, perm)
 
 def ensure_user(uid):
+    existed = mongo_store.get_user(uid, {"_id": 1}) is not None
     mongo_store.ensure_user(uid)
+    return not existed
 
 def get_usdt_rate():
     value = get_setting("usdt_rate")
@@ -818,6 +820,51 @@ async def detect_account_year(client):
     return year
 
 # ================= LOGGING LOGIC =================
+async def send_important_log(message):
+    """Send an important audit event without affecting the business operation."""
+    try:
+        await bot.send_message(LOG_CHANNEL_ID, message)
+    except Exception:
+        logger.exception("Important audit log delivery failed")
+
+async def get_user_label(uid):
+    try:
+        user = await bot.get_entity(int(uid))
+        username = getattr(user, "username", None)
+        return f"<code>{uid}</code> / @{html.escape(username)}" if username else f"<code>{uid}</code> / NoUsername"
+    except Exception:
+        return f"<code>{uid}</code> / NoUsername"
+
+async def log_new_user(uid):
+    await send_important_log(
+        f"👤 <b>New User</b>\n\nUser: {await get_user_label(uid)}"
+    )
+
+async def log_purchase(uid, country, quantity, amount, order_id, success, reason=None):
+    status = "Success" if success else "Failed"
+    details = f"\nReason: {html.escape(str(reason))}" if reason else ""
+    await send_important_log(
+        f"🛒 <b>Purchase {status}</b>\n\n"
+        f"User: {await get_user_label(uid)}\n"
+        f"Product/Country: {html.escape(str(country))}\n"
+        f"Quantity: {quantity}\nAmount: ₹{amount}\n"
+        f"Order ID: <code>{html.escape(str(order_id or 'N/A'))}</code>{details}"
+    )
+
+async def log_manual_deposit(uid, amount, utr, approved, credit_amount=0):
+    await send_important_log(
+        f"💰 <b>Manual Deposit {'Approved' if approved else 'Rejected'}</b>\n\n"
+        f"User: {await get_user_label(uid)}\nAmount: ₹{amount}\n"
+        f"UTR: <code>{html.escape(str(utr or 'N/A'))}</code>\n"
+        f"Credit amount: ₹{credit_amount if approved else 0}"
+    )
+
+async def log_admin_action(uid, action, details):
+    await send_important_log(
+        f"👑 <b>Admin Action: {html.escape(action)}</b>\n\n"
+        f"Admin: {await get_user_label(uid)}\n{details}"
+    )
+
 async def process_referral_bonus(uid, amount, event_key):
     user = mongo_store.get_user(uid, {"referred_by": 1})
     ref = user.get("referred_by") if user else None
@@ -866,19 +913,9 @@ async def log_primary_deposit(uid, amt, method):
         except Exception as e: logger.error(f"Failed Log: {e}")
     except Exception as e: logger.error(f"Global Dep Log Err: {e}")
 
-async def log_primary_purchase(uid, country, price, amount, year, qty):
+async def log_primary_purchase(uid, country, price, amount, year, qty, order_id=None):
     try:
-        t = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        msg = (f"{PE_LIGHTNING} <b>NEW PURCHASE SUCCESSFUL</b>\n\n"
-               f"{P_ID} Uꜱᴇʀ Iᴅ: <code>{uid}</code>\n"
-               f"{P_GLOBE} Cᴏᴜɴᴛʀʏ: {country}\n"
-               f"{P_MONEY} Pʀɪᴄᴇ: {P_INR}{price}\n"
-               f"{P_CARD} Tᴏᴛᴀʟ Pᴀɪᴅ: {P_INR}{amount}\n"
-               f"{P_CAL} Yᴇᴀʀ: {year}\n"
-               f"{P_PKG} Qᴜᴀɴᴛɪᴛʏ: {qty}\n"
-               f"{P_TIME} Tɪᴍᴇ: {t}")
-        try: await bot.send_message(LOG_CHANNEL_ID, msg)
-        except: pass
+        await log_purchase(uid, country, qty, amount, order_id, True)
     except Exception as e: logger.error(f"Pur Log Err: {e}")
 
 # ================= MENU HELPERS =================
@@ -1302,6 +1339,11 @@ async def show_automatic_payment_qr(event, amount):
             created_at.isoformat(),
             expires_at.isoformat(),
         )
+        await send_important_log(
+            f"⚡ <b>Automatic Payment Initiated</b>\n\n"
+            f"User: {await get_user_label(uid)}\nAmount: ₹{amount}\n"
+            f"Order ID: <code>{html.escape(str(order_id))}</code>"
+        )
         payment_message = automatic_payment_message(amount, order_id)
         await event.delete()
         await bot.send_file(
@@ -1423,6 +1465,12 @@ async def check_automatic_payment(event, order_id):
             )
             return await send_automatic_check_result(event, "✅ Payment already verified.")
         new_balance = credit.get("balance", previous_balance + amount)
+        await send_important_log(
+            f"⚡ <b>Automatic Payment Verified</b>\n\n"
+            f"User: {await get_user_label(uid)}\nAmount: ₹{amount}\n"
+            f"Order ID: <code>{html.escape(str(order_id))}</code>\n"
+            f"Balance: ₹{previous_balance} → ₹{new_balance}"
+        )
         try:
             await event.delete()
         except Exception:
@@ -1876,6 +1924,7 @@ async def _process_purchase(
             match_any_dc=dc_was_omitted,
         )
         if not reserved:
+            await log_purchase(uid, country, 1, final_price, purchase_id, False, "Out of stock")
             return await event.answer("❌ Sold out! Another user just bought this account.", alert=True)
 
         phone = reserved["phone"]
@@ -1893,6 +1942,7 @@ async def _process_purchase(
             )
             if not debited:
                 mongo_store.release_inventory([phone])
+                await log_purchase(uid, country, 1, final_price, purchase_id, False, "Insufficient balance")
                 return await event.answer(f"❌ Insufficient Balance! Need ₹{final_price}", alert=True)
         except Exception:
             mongo_store.release_inventory([phone])
@@ -1927,6 +1977,7 @@ async def _process_purchase(
         except Exception:
             logger.exception("process_purchase disconnect failed uid=%s phone=%s", uid, phone)
         delete_session_files(sess)
+        await log_purchase(uid, country, 1, final_price, purchase_id, False, "Session unauthorized or unavailable")
         return await event.edit(f"{P_NO} <b>Account Invalid.</b> Money refunded. Try buying another.")
 
     msg = (f"{PE_LIGHTNING} <b>Order Active!</b>\n\n"
@@ -1972,7 +2023,10 @@ async def auto_otp_task(phone):
             if code:
                 if not order['paid']:
                     async with get_user_lock(uid):
-                        mongo_store.create_order(
+                        existing_order = mongo_store.orders.find_one({
+                            "purchase_key": f"purchase:single:{order['purchase_id']}"
+                        })
+                        order_document = mongo_store.create_order(
                             uid,
                             order['country'],
                             order['year'],
@@ -1984,7 +2038,16 @@ async def auto_otp_task(phone):
                         order['paid'] = True
                         mongo_store.delete_inventory(phone)
                     
-                    await log_primary_purchase(uid, order['country'], order['price'], order['price'], order['year'], 1)
+                    if existing_order is None:
+                        await log_primary_purchase(
+                            uid,
+                            order['country'],
+                            order['price'],
+                            order['price'],
+                            order['year'],
+                            1,
+                            order_document.get("_id"),
+                        )
                 
                 twofa_text = f"{P_2FA} <b>2FA:</b> <code>{order['twofa']}</code>" if order['twofa'] != "None" else f"🔓 <b>2FA:</b> <code>Disabled (No Password)</code>"
                 msg_text = (f"{PE_CHECK} <b>Latest OTP Fetched!</b>\n\n"
@@ -2059,6 +2122,7 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
             qty, country, year, price, category, dc
         )
         if len(reserved) < qty:
+            await log_purchase(uid, country, qty, final_cost, "N/A", False, "Stock changed")
             return await event.respond(f"{P_NO} Stock changed during processing. Purchase Cancelled.")
         
         try:
@@ -2072,6 +2136,7 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
             )
             if not debited:
                 mongo_store.release_inventory(item["phone"] for item in reserved)
+                await log_purchase(uid, country, qty, final_cost, "N/A", False, "Insufficient balance")
                 return await event.respond(f"{P_NO} Insufficient Balance! Purchase Cancelled.")
 
             price_per_acc = final_cost // qty
@@ -2125,7 +2190,15 @@ async def process_bulk_sessions(event, uid, qty, state, final_cost):
             
         caption = f"{PE_GIFT} <b>Bulk Purchase Successful!</b>\n\n{P_FLAG} Country: {country}\n{P_PKG} Quantity: {qty}\n{P_CARD} Total Paid: {P_INR}{final_cost}\n\n<i>(Note: Sessions are safely provided, the bot does not keep them active)</i>"
         await bot.send_file(uid, zip_name, caption=caption)
-        await log_primary_purchase(uid, country, price, final_cost, year, qty)
+        await log_primary_purchase(
+            uid,
+            country,
+            price,
+            final_cost,
+            year,
+            qty,
+            ", ".join(str(order_id) for order_id in created_order_ids),
+        )
     except Exception as e: await event.respond(f"{P_WARN} Error creating zip: {e}")
     finally:
         if os.path.exists(zip_name): os.remove(zip_name)
@@ -2829,7 +2902,9 @@ async def admin_actions(event):
         if method not in PAYMENT_METHOD_SETTINGS:
             return await event.answer("Invalid payment method.", alert=True)
         setting = PAYMENT_METHOD_SETTINGS[method]
-        set_setting(setting, "off" if is_payment_method_enabled(method) else "on")
+        new_value = "off" if is_payment_method_enabled(method) else "on"
+        set_setting(setting, new_value)
+        await log_admin_action(uid, "Payment method change", f"Method: {method}\nStatus: {new_value}")
         await event.answer("Payment method visibility updated.", alert=True)
         return await payment_methods_menu(event)
 
@@ -2862,6 +2937,7 @@ async def admin_actions(event):
         if pending != {"type": "maintenance_confirm", "value": desired}:
             return await event.answer("This confirmation has expired.", alert=True)
         set_setting("maintenance_enabled", desired)
+        await log_admin_action(uid, "Maintenance mode change", f"Status: {desired}")
         admin_content_state.pop(uid, None)
         await event.answer("Maintenance mode updated.", alert=True)
         return await maintenance_menu(event)
@@ -2931,6 +3007,13 @@ async def admin_actions(event):
         )
         if not result.get("applied") and not result.get("already_applied"):
             return await event.answer("Balance change was not applied.", alert=True)
+        if result.get("applied"):
+            await log_admin_action(
+                uid,
+                "Balance adjustment",
+                f"Target user: <code>{target_id}</code>\nAmount: ₹{amount}\n"
+                f"New balance: ₹{result.get('balance', 'N/A')}",
+            )
         await event.answer("Balance updated.", alert=True)
         return await render_user_management(event, target_id)
 
@@ -3273,6 +3356,7 @@ async def admin_actions(event):
                 cap_msg = (await get_reply(f"{P_DOC} <b>Enter Payment Caption:</b>\n<i>(Use <code>text</code> to make wallet IDs or UPI copyable)</i>")).text
                 cap_msg = html.escape(cap_msg).replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
                 mongo_store.add_custom_payment(name, cap_msg, qr_file_id)
+                await log_admin_action(uid, "Payment method added", f"Method: {name}")
                 await conv.send_message(f"{P_YES} Payment Method '{name}' added successfully!")
 
             elif action_data == "delpay" and (uid in ADMIN_IDS or has_perm(uid, 'p_settings')):
@@ -3293,6 +3377,7 @@ async def admin_actions(event):
                     if not payment:
                         raise ValueError
                     mongo_store.delete_custom_payment(payment["_id"])
+                    await log_admin_action(uid, "Payment method removed", f"Method: {payment.get('name', 'unknown')}")
                     await conv.send_message(f"{P_YES} Deleted!")
                 except: await conv.send_message(f"{P_NO} Invalid ID.")
 
@@ -3560,7 +3645,8 @@ async def handle_start(e):
         uid = e.sender_id
         if not uid: return
         
-        ensure_user(uid)
+        if ensure_user(uid):
+            await log_new_user(uid)
         if is_user_banned(uid): return
 
         if (not is_bot_online() or is_maintenance_mode()) and not is_admin(uid):
@@ -3604,7 +3690,8 @@ async def handle_all_messages(e):
         if (not is_bot_online() or is_maintenance_mode()) and not is_admin(uid):
             return await e.respond(get_maintenance_message() if is_maintenance_mode() else f"{P_OFF} <b>Bot is currently under maintenance.</b> Please try again later.")
         
-        ensure_user(uid)
+        if ensure_user(uid):
+            await log_new_user(uid)
         if is_user_banned(uid): return
 
         if uid in waiting_proof and (e.photo or (e.text and "http" in e.text)):
@@ -3696,6 +3783,7 @@ async def handle_all_messages(e):
                         if not value.isdigit() or int(value) < 1:
                             raise ValueError
                     set_setting(name, value)
+                    await log_admin_action(uid, "Important setting change", f"Setting: {name}\nNew value: {html.escape(str(value))}")
                     admin_content_state.pop(uid, None)
                     return await e.reply(f"✅ <b>{name}</b> saved.", buttons=[[Button.inline("Back", "adm_general")]])
                 except ValueError:
@@ -3704,12 +3792,14 @@ async def handle_all_messages(e):
                 if not text.strip():
                     return await e.reply("❌ Maintenance message cannot be empty.")
                 set_setting("maintenance_message", text.strip())
+                await log_admin_action(uid, "Maintenance message change", "Message updated")
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Maintenance message saved.", buttons=[[Button.inline("Back", "adm_maintenance")]])
             if content_type == "welcome":
                 if not text:
                     return await e.reply("❌ Welcome message cannot be empty.")
                 set_setting("welcome_message", text)
+                await log_admin_action(uid, "Important setting change", "Setting: welcome_message\nNew value: updated")
                 admin_content_state.pop(uid, None)
                 return await e.reply("✅ Welcome message saved.")
             if content_type == "banner":
@@ -3779,6 +3869,13 @@ async def handle_all_messages(e):
                 if not transitioned:
                     admin_dep_state.pop(uid, None)
                     return await e.reply(f"{P_WARN} Deposit already processed.")
+                deposit = mongo_store.get_deposit(dep_id) or {}
+                await log_manual_deposit(
+                    t_uid,
+                    deposit.get("amount", 0),
+                    deposit.get("utr"),
+                    False,
+                )
                 
                 try: await bot.edit_message(LOG_CHANNEL_ID, msg_id, f"{P_NO} <b>REJECTED USER {t_uid}</b>\nReason: {html.escape(text)}")
                 except: pass
@@ -3866,7 +3963,8 @@ async def handle_callback_query(e):
                 alert=True
             )
             
-        ensure_user(uid)
+        if ensure_user(uid):
+            await log_new_user(uid)
         now = time.time()
         if uid in user_spam_cooldown and now - user_spam_cooldown[uid] < 0.5:
             return await e.answer("⚠️ Please slow down! Don't spam buttons.", alert=True)
@@ -4105,6 +4203,13 @@ async def handle_callback_query(e):
                 )
                 if not approval.get("credited"):
                     return await e.edit(f"{P_WARN} Already processed.")
+                await log_manual_deposit(
+                    t_uid,
+                    approval["amount"],
+                    deposit.get("utr"),
+                    True,
+                    approval["amount"],
+                )
                 await e.edit(f"{PE_CHECK} <b>APPROVED {P_INR}{amt} TO {t_uid} (Custom Amount)</b>")
                 await bot.send_message(int(t_uid), f"{PE_CHECK} <b>Deposit Approved!</b>\n{P_MONEY} Amount Added: {P_INR}{amt}\n📉 Old: {P_INR}{prev_bal} | 📈 New: {P_INR}{prev_bal+amt}")
                 return
@@ -4137,6 +4242,13 @@ async def handle_callback_query(e):
                 )
                 if not approval.get("credited"):
                     return await e.edit(f"{P_WARN} Already processed.")
+                await log_manual_deposit(
+                    t_uid,
+                    amt,
+                    deposit.get("utr"),
+                    True,
+                    amt,
+                )
                 
                 user_msg = (f"{PE_CHECK} <b>Deposit Approved!</b>\n\n{P_MONEY} <b>Amount Added:</b> ${to_usd(amt):.2f} ({P_INR}{amt})\n"
                             f"📉 <b>Previous Balance:</b> ${to_usd(prev_bal):.2f} ({P_INR}{prev_bal})\n📈 <b>New Balance:</b> ${to_usd(prev_bal+amt):.2f} ({P_INR}{prev_bal+amt})")
