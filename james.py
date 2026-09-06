@@ -744,6 +744,66 @@ def parse_inr_price(value):
     return int(round(parsed))
 
 
+def parse_single_account_metadata(text):
+    """Parse the combined metadata submitted for a single account."""
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        raise ValueError("Metadata cannot be empty.")
+
+    values = {}
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if len(lines) == 1 and "|" in lines[0]:
+        parts = [part.strip() for part in lines[0].split("|")]
+        if len(parts) != 5:
+            raise ValueError("Use exactly five pipe-separated values: Country | Condition | Data Center | Year | Price.")
+        values = dict(zip(("country", "condition", "data_center", "year", "price"), parts))
+    else:
+        field_names = {
+            "country": "country",
+            "condition": "condition",
+            "type": "condition",
+            "data center": "data_center",
+            "dc": "data_center",
+            "year": "year",
+            "price": "price",
+        }
+        for line in lines:
+            if ":" not in line:
+                raise ValueError("Each metadata line must use the format Field: Value.")
+            key, value = line.split(":", 1)
+            normalized_key = re.sub(r"\s+", " ", key.strip().lower())
+            field = field_names.get(normalized_key)
+            if not field:
+                raise ValueError(f"Unknown metadata field: {key.strip()}.")
+            values[field] = value.strip()
+
+    country = normalize_optional_text(values.get("country"))
+    if not country:
+        raise ValueError("Country is required.")
+
+    year_text = normalize_optional_text(values.get("year"))
+    year = None
+    if year_text:
+        try:
+            year = int(year_text)
+            if year <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("Year must be a valid positive year or /skip.") from None
+
+    price = parse_inr_price(values.get("price"))
+    if price is None:
+        raise ValueError("Price is required and must be a valid INR amount.")
+
+    return {
+        "country": country,
+        "condition": normalize_optional_text(values.get("condition")),
+        "data_center": normalize_optional_text(values.get("data_center")) or None,
+        "year": year,
+        "price": price,
+    }
+
+
 def is_user_banned(uid):
     user = mongo_store.get_user(uid, {"banned": 1})
     return bool(user and user.get("banned") == 1)
@@ -3600,43 +3660,37 @@ async def admin_actions(event):
                     twofa_pass = html.escape((await get_reply(f"{P_2FA} 2FA Pass required. Enter it now:")).text)
                     await client.sign_in(password=twofa_pass)
 
-                c_name = ""
+                metadata_prompt = (
+                    "📦 ACCOUNT DETAILS\n\n"
+                    "Send the details in this format:\n\n"
+                    "Country: India\n"
+                    "Condition: Spammed\n"
+                    "Data Center: 5\n"
+                    "Year: 2025\n"
+                    "Price: 15\n\n"
+                    "Or send them in one line:\n"
+                    "India | Spammed | 5 | 2025 | 15\n\n"
+                    "Then:\n"
+                    "(Type /cancel to abort)"
+                )
                 while True:
-                    c_name = normalize_optional_text((await get_reply(f"{P_GLOBE} <b>Country:</b>\nEnter country name.")).text)
-                    if c_name:
-                        break
-                    await conv.send_message(f"{P_WARN} Country is required. Please enter a country name or /cancel to abort.")
-
-                category = ""
-                category_value = normalize_optional_text((await get_reply(f"{P_DOC} <b>Condition / Type:</b>\nExample: Spam Free, Spammed Account, etc.\nOr type <code>/skip</code>")).text)
-                if category_value:
-                    category = category_value
-
-                dc = None
-                dc_value = normalize_optional_text((await get_reply(f"{P_PC} <b>Data Center:</b>\nEnter DC or type <code>/skip</code>.")).text)
-                if dc_value:
-                    dc = dc_value
-
-                year = None
-                while True:
-                    year_raw = normalize_optional_text((await get_reply(f"{P_CAL} <b>Year:</b>\nEnter year or type <code>/skip</code>.")).text)
-                    if not year_raw:
-                        break
+                    await conv.send_message(metadata_prompt)
+                    metadata_response = await conv.get_response()
+                    if metadata_response.text and metadata_response.text.strip().lower() == "/cancel":
+                        raise ValueError("Cancelled")
                     try:
-                        year = int(year_raw)
-                        if year <= 0:
-                            raise ValueError
-                        break
-                    except ValueError:
-                        await conv.send_message(f"{P_WARN} Invalid year. Please enter a valid year or type <code>/skip</code>.")
+                        metadata = parse_single_account_metadata(metadata_response.text)
+                    except ValueError as exc:
+                        logger.warning("Single account metadata validation failed for admin=%s: %s", uid, exc)
+                        await conv.send_message(f"{P_WARN} {exc}\nPlease resend all account details together.")
+                        continue
+                    break
 
-                price = None
-                while True:
-                    price_raw = (await get_reply(f"{P_MONEY} <b>Price (₹):</b>\nEnter selling price in INR.")).text
-                    price = parse_inr_price(price_raw)
-                    if price is not None:
-                        break
-                    await conv.send_message(f"❌ Price is required.\n\nPlease enter the price in INR.\nOr provide /cancel to abort.")
+                c_name = metadata["country"]
+                category = metadata["condition"]
+                dc = metadata["data_center"]
+                year = metadata["year"]
+                price = metadata["price"]
 
                 c_icon = get_flag_by_country_name(c_name) or "🌍"
                 if c_icon == "🌍" and (country_name := c_name.lower()):
