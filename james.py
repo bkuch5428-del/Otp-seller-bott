@@ -1775,24 +1775,23 @@ def resolve_product(token):
 
 
 def format_store_product_line(product):
-    display = f"{product['icon']} {product['country']}"
+    display = html.escape(str(product["country"]))
     category = normalize_optional_text(product.get("category"))
     if category:
-        display += f" ({category})"
+        display += f" ({html.escape(category)})"
     dc = normalize_optional_text(product.get("dc"))
     if dc:
-        display += f" (dc {dc})"
+        display += f" (dc {html.escape(dc)})"
     if product.get("year"):
-        display += f" {product['year']}"
+        display += f" {html.escape(str(product['year']))}"
     display += f": ${to_usd(product['price']):.2f} (₹{product['price']}) - Stock: {product['stock']}"
-    return f"> • {display}"
+    return f"• {display}"
 
 
 def get_product_button_label(product):
-    icon = product.get("icon") or "🌍"
-    country = str(product.get("country") or "Unknown").strip()
+    country = str(product.get("country") or "Unknown")
     category = normalize_optional_text(product.get("category"))
-    label = f"{icon} {country}"
+    label = country
     if category:
         short = f" • {category}"
         if len(label + short) <= 22:
@@ -1805,13 +1804,14 @@ def get_product_button_label(product):
 def account_store_caption(products, page, total_pages, page_products, flow):
     labels = get_store_buttons(flow)
     product_lines = [format_store_product_line(product) for product in page_products]
+    product_text = "\n".join(product_lines)
     page_text = ""
     if total_pages > 1:
         page_text = f"\n\n📄 {html.escape(labels['page'].format(page=page, total_pages=total_pages))}"
     values = {
         "rate": f"{get_usdt_rate():g}",
         "available": sum(product["stock"] for product in products),
-        "products": "\n".join(product_lines) if product_lines else f"\n\n{P_PKG} No accounts/sessions are currently available.\n\nPlease check again later.",
+        "products": f"<blockquote>{product_text}</blockquote>" if product_lines else f"\n\n{P_PKG} No accounts/sessions are currently available.\n\nPlease check again later.",
         "page": page_text,
         "total_pages": total_pages
     }
